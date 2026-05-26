@@ -1,0 +1,27 @@
+{
+  "name": "asistente-decasa",
+  "version": "1.0.0",
+  "description": "Asistente WhatsApp con IA (Gemini) para DeCasa",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node index.js",
+    "test": "jest",
+    "test:unit": "jest --testPathPattern=unit",
+    "test:integration": "jest --testPathPattern=integration",
+    "test:conversation": "jest --testPathPattern=conversation"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0",
+    "supertest": "^6.3.4"
+  },
+  "dependencies": {
+    "cloudinary": "^2.10.0",
+    "dotenv": "^16.6.1",
+    "express": "^4.18.2",
+    "mysql2": "^3.22.1",
+    "openai": "^4.104.0",
+    "replicate": "^1.4.0",
+    "twilio": "^4.19.0"
+  }
+}
