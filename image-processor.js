@@ -1,5 +1,6 @@
-﻿require('dotenv').config();
-const Replicate = require('replicate');
+require('dotenv').config();
+const OpenAI = require('openai');
+const { toFile } = require('openai');
 const cloudinary = require('cloudinary').v2;
 
 cloudinary.config({
@@ -8,88 +9,74 @@ cloudinary.config({
   api_secret: process.env.CLOUDINARY_API_SECRET
 });
 
-const replicate = new Replicate({ auth: process.env.REPLICATE_API_KEY });
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 async function downloadFromTwilio(mediaUrl) {
   const auth = Buffer.from(
     process.env.TWILIO_ACCOUNT_SID + ':' + process.env.TWILIO_AUTH_TOKEN
   ).toString('base64');
-  
+
   const { fetchWithTimeout } = require('./httpClient');
   const response = await fetchWithTimeout(mediaUrl, {
     headers: { 'Authorization': 'Basic ' + auth }
   });
-  
+
   if (!response.ok) {
     throw new Error('Failed to download from Twilio: ' + response.status);
   }
-  
+
   return Buffer.from(await response.arrayBuffer());
 }
 
-async function uploadToCloudinary(imageBuffer, filename) {
-  filename = filename || 'room-image';
+async function uploadBase64ToCloudinary(b64) {
   return new Promise((resolve, reject) => {
-    cloudinary.uploader.upload_stream(
-      { folder: 'decasa-rooms', public_id: filename + '-' + Date.now() },
+    cloudinary.uploader.upload(
+      `data:image/png;base64,${b64}`,
+      { folder: 'decasa-rooms', public_id: 'room-result-' + Date.now() },
       (error, result) => {
         if (error) reject(error);
         else resolve(result.secure_url);
       }
-    ).end(imageBuffer);
+    );
   });
 }
 
-async function processWithReplicate(imageUrl, sofaDescription) {
-  var prompt = sofaDescription 
-    ? 'Add a ' + sofaDescription + ' in this living room. Match lighting, shadows and perspective. Keep realistic proportions and photorealistic quality.'
-    : 'Add a modern sofa in this living room. Match lighting, shadows and perspective. Keep realistic proportions.';
-  
-  const output = await replicate.run(
-    'black-forest-labs/flux-kontext-pro',
-    {
-      input: {
-        input_image: imageUrl,
-        prompt: prompt,
-        aspect_ratio: 'match_input_image'
-      }
-    }
-  );
-  
-  return output;
+async function processWithOpenAI(imageBuffer, furnitureDescription) {
+  const prompt = furnitureDescription
+    ? `Realistically place a ${furnitureDescription} in this room. Keep all existing furniture, lighting, shadows and perspective. The result must look like a real photo.`
+    : `Add a modern solid wood furniture piece in this room. Keep existing elements, lighting and perspective realistic.`;
+
+  const imageFile = await toFile(imageBuffer, 'room.png', { type: 'image/png' });
+
+  const response = await openai.images.edit({
+    model: 'gpt-image-1',
+    image: imageFile,
+    prompt,
+    n: 1,
+    size: '1024x1024'
+  });
+
+  return response.data[0].b64_json;
 }
 
 async function processRoomImage(mediaUrl, sofaInfo) {
   sofaInfo = sofaInfo || null;
   try {
-    console.log('Downloading image from Twilio...');
+    console.log('[IMG] Descargando imagen de Twilio...');
     const imageBuffer = await downloadFromTwilio(mediaUrl);
-    
-    console.log('Uploading to Cloudinary...');
-    const cloudinaryUrl = await uploadToCloudinary(imageBuffer);
-    
-    console.log('Processing with Replicate...', cloudinaryUrl);
+
+    console.log('[IMG] Procesando con OpenAI gpt-image-1...');
     const sofaDesc = sofaInfo ? (sofaInfo.descripcion || sofaInfo.nombre || null) : null;
-    const resultUrl = await processWithReplicate(cloudinaryUrl, sofaDesc);
-    
-    return { success: true, imageUrl: resultUrl };
+    const b64 = await processWithOpenAI(imageBuffer, sofaDesc);
+
+    console.log('[IMG] Subiendo resultado a Cloudinary...');
+    const cloudinaryUrl = await uploadBase64ToCloudinary(b64);
+
+    return { success: true, imageUrl: cloudinaryUrl };
   } catch (error) {
-    console.error('Error processing image:', error);
-    
-    // Detect Replicate credit error (402 Payment Required)
-    const errorStr = error.message || '';
-    const isCreditError = errorStr.includes('402') || errorStr.includes('Insufficient credit') || errorStr.includes('Payment Required');
-    
-    if (isCreditError) {
-      return { 
-        success: false, 
-        error: 'NO_CREDIT', 
-        message: 'Nuestro servicio de IA esta temporalmente no disponible por mantenimiento.' 
-      };
-    }
-    
+    console.error('[IMG] Error:', error.message);
     return { success: false, error: error.message };
   }
 }
 
-module.exports = { processRoomImage, uploadToCloudinary, downloadFromTwilio };
+module.exports = { processRoomImage, downloadFromTwilio };

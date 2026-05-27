@@ -920,7 +920,7 @@ app.post('/webhook', async (req, res) => {
               mediaUrl: [result.imageUrl]
             });
           } else {
-            // Replicate sin crédito u otro error: caer al flujo Vision
+            // Error en generación de imagen: caer al flujo Vision
             // para al menos mostrar opciones del catálogo con fotos
             await twilioClient.messages.create({
               from: toNumber, to: from,
