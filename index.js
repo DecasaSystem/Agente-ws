@@ -896,7 +896,7 @@ app.post('/webhook', async (req, res) => {
     if (mediaUrl && mediaType?.startsWith('image/')) {
       // Visualización de sala: solo si el cliente lo pide explícitamente
       const esVisualizacion = !!incomingMsg &&
-        /\b(sala|cuarto|habitaci[oó]n|ambiente|visualiz|pon\s+(el|la)|quiero\s+ver\s+c[oó]mo|c[oó]mo\s+(quedar[íi]a|se\s+ver[íi]a|luce|quedar[ií]an)|quedar[íi]a\s+(bien|aqu[íi]|ac[aá]|en)|se\s+ver[íi]a\s+(bien|aqu[íi]|ac[aá]))\b/i.test(incomingMsg);
+        /\b(sala|cuarto|habitaci[oó]n|ambiente|visualiz|pon\s+(el|la)|c[oó]mo\s+(quedar[íi]a[n]?|se\s+ver[íi]a[n]?|luce[n]?|queda[n]?)|quedar[íi]a[n]?\s+(bien|aqu[íi]|ac[aá]|en)|se\s+ver[íi]a[n]?\s+(bien|aqu[íi]|ac[aá])|queda[n]?\s+(bien|aqu[íi]|ac[aá]|en\s+este|en\s+mi)|ver\s+c[oó]mo\s+queda|quiero\s+ver\s+c[oó]mo)\b/i.test(incomingMsg);
 
       const twiml = new MessagingResponse();
       twiml.message(esVisualizacion
