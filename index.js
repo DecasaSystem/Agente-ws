@@ -150,49 +150,49 @@ const UBICACIONES = {
   5: 'Cra. 14 #11 - 93, Pereira, Risaralda'
 };
 
-// ─── TELEGRAM NOTIFICACIONES ─────────────────────────────────────────────────
+// ─── NOTIFICACIONES → SISTEMA DE VENTAS DECASA ───────────────────────────────
 
 async function enviarNotificacionTelegram(telefono, mensaje, historial, tipo = 'asesor', extra = {}) {
-  const token = process.env.TELEGRAM_BOT_TOKEN;
-  const chatId = process.env.TELEGRAM_CHAT_ID;
-  if (!token || !chatId) return;
+  const apiUrl   = process.env.DECASA_API_URL;
+  const apiToken = process.env.DECASA_AGENT_TOKEN;
+  if (!apiUrl) {
+    console.warn('[REDES] DECASA_API_URL no configurado — notificación omitida');
+    return;
+  }
 
-  const historialTexto = (historial || []).slice(-6).map(m =>
-    `${m.role === 'user' ? '👤' : '🤖'} ${String(m.content).substring(0, 100)}`
-  ).join('\n');
+  const telefonoLimpio = telefono.replace(/\D/g, '');
+  const nombreCliente  = extra.nombre || null;
+  const whatsappUrl    = `https://wa.me/${telefonoLimpio}`;
 
   const titulos = {
-    asesor: '🆘 SOLICITUD DE ASESOR',
-    pedido: '📦 NUEVO PEDIDO',
-    cita: '📅 NUEVA CITA',
-    personalizacion: '🎨 PERSONALIZACIÓN'
+    asesor:         'Solicitud de asesor',
+    pedido:         'Nuevo pedido confirmado',
+    cita:           'Nueva cita agendada',
+    personalizacion: 'Solicitud de personalización'
   };
 
-  const titulo = titulos[tipo] || titulos.asesor;
-  const productoLine = extra.producto ? `📌 <b>Producto:</b> ${extra.producto}\n` : '';
-  const texto = `<b>${titulo} - DeCasa</b>
-━━━━━━━━━━━━━━━━━━━━━
-📱 <b>Cliente:</b> ${telefono}
-${productoLine}💬 <b>Mensaje:</b> ${String(mensaje).substring(0, 200)}
-🕐 <b>Hora:</b> ${new Date().toLocaleString('es-CO', { timeZone: 'America/Bogota' })}
-━━━━━━━━━━━━━━━━━━━━━
-📋 <b>Historial:</b>
-${historialTexto || '(sin historial)'}
-━━━━━━━━━━━━━━━━━━━━━
-💡 <a href="wa.me/${telefono.replace(/\D/g, '')}">Responder por WhatsApp</a>`;
+  let resumen = titulos[tipo] || 'Notificación';
+  if (extra.producto) resumen += ` — ${extra.producto}`;
+  if (mensaje)        resumen += `\n${String(mensaje).substring(0, 300)}`;
+
+  const payload = {
+    tipo:           tipo,
+    telefono:       telefono.replace('whatsapp:', ''),
+    nombre_cliente: nombreCliente,
+    resumen:        resumen,
+    historial:      (historial || []).slice(-8).map(m => ({ role: m.role, content: String(m.content).substring(0, 150) })),
+    whatsapp_url:   whatsappUrl,
+  };
 
   try {
-    await fetchWithRetry(`https://api.telegram.org/bot${token}/sendMessage`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chat_id: chatId, text: texto,
-        parse_mode: 'HTML', disable_web_page_preview: true
-      })
+    await fetchWithRetry(`${apiUrl}/api/redes/webhook`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Agent-Token': apiToken || '' },
+      body:    JSON.stringify(payload)
     }, 2, 10000);
-    console.log(`[TELEGRAM] Notificación ${tipo} enviada`);
+    console.log(`[REDES] Notificación ${tipo} enviada al sistema`);
   } catch (e) {
-    console.error('[TELEGRAM] Error:', e.message);
+    console.error('[REDES] Error enviando notificación:', e.message);
   }
 }
 
