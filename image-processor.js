@@ -40,22 +40,53 @@ async function uploadBufferToCloudinary(buffer) {
   });
 }
 
-// Elimina fondo claro (blanco, crema, gris claro) dejando transparencia
+// Flood-fill desde los bordes para detectar y eliminar el fondo
+// Más robusto que un umbral global: maneja sombras y gradientes
 async function removeBackground(imageBuffer) {
-  const image = sharp(imageBuffer).ensureAlpha();
-  const { data, info } = await image.raw().toBuffer({ resolveWithObject: true });
+  const { data, info } = await sharp(imageBuffer)
+    .ensureAlpha()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+
   const { width, height } = info;
   const pixels = Buffer.from(data);
+  const TOLERANCE = 40;
 
-  // Umbral para considerar "fondo claro"
-  const TOLERANCE = 35;
+  // Muestrear color de fondo promediando las 4 esquinas
+  const cornerIdxs = [0, (width - 1), (height - 1) * width, (height - 1) * width + (width - 1)];
+  let sumR = 0, sumG = 0, sumB = 0;
+  for (const ci of cornerIdxs) {
+    sumR += pixels[ci * 4]; sumG += pixels[ci * 4 + 1]; sumB += pixels[ci * 4 + 2];
+  }
+  const bgR = Math.round(sumR / 4), bgG = Math.round(sumG / 4), bgB = Math.round(sumB / 4);
 
-  for (let i = 0; i < pixels.length; i += 4) {
-    const r = pixels[i], g = pixels[i + 1], b = pixels[i + 2];
-    const isNearWhite = r > 255 - TOLERANCE && g > 255 - TOLERANCE && b > 255 - TOLERANCE;
-    // También captura tonos crema/beige claros comunes en fotos de muebles
-    const isNearCream = r > 220 && g > 200 && b > 180 && r >= g && g >= b;
-    if (isNearWhite || isNearCream) pixels[i + 3] = 0;
+  const similar = (pi) => {
+    const r = pixels[pi], g = pixels[pi + 1], b = pixels[pi + 2];
+    return Math.abs(r - bgR) < TOLERANCE && Math.abs(g - bgG) < TOLERANCE && Math.abs(b - bgB) < TOLERANCE;
+  };
+
+  // BFS desde todos los píxeles del borde que sean similares al fondo
+  const visited = new Uint8Array(width * height);
+  const queue = [];
+
+  const seed = (x, y) => {
+    const pos = y * width + x;
+    if (!visited[pos] && similar(pos * 4)) { visited[pos] = 1; queue.push(pos); }
+  };
+
+  for (let x = 0; x < width; x++) { seed(x, 0); seed(x, height - 1); }
+  for (let y = 0; y < height; y++) { seed(0, y); seed(width - 1, y); }
+
+  while (queue.length > 0) {
+    const pos = queue.pop();
+    pixels[pos * 4 + 3] = 0; // transparente
+    const x = pos % width, y = Math.floor(pos / width);
+    for (const [dx, dy] of [[-1, 0], [1, 0], [0, -1], [0, 1]]) {
+      const nx = x + dx, ny = y + dy;
+      if (nx < 0 || nx >= width || ny < 0 || ny >= height) continue;
+      const npos = ny * width + nx;
+      if (!visited[npos] && similar(npos * 4)) { visited[npos] = 1; queue.push(npos); }
+    }
   }
 
   return sharp(pixels, { raw: { width, height, channels: 4 } }).png().toBuffer();
