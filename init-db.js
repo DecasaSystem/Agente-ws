@@ -19,7 +19,7 @@ async function initDB() {
 
     await connection.query(`
       CREATE TABLE IF NOT EXISTS usuarios (
-        id INT AUTO_INCREMENT PRIMARY KEY,
+        id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
         telefono VARCHAR(20) UNIQUE NOT NULL,
         nombre VARCHAR(100),
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -30,8 +30,8 @@ async function initDB() {
 
     await connection.query(`
       CREATE TABLE IF NOT EXISTS conversaciones (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        usuario_id INT NOT NULL,
+        id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+        usuario_id BIGINT UNSIGNED NOT NULL,
         role ENUM('user', 'assistant') NOT NULL,
         contenido TEXT NOT NULL,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -43,7 +43,7 @@ async function initDB() {
 
     await connection.query(`
       CREATE TABLE IF NOT EXISTS estado_usuario (
-        usuario_id INT PRIMARY KEY,
+        usuario_id BIGINT UNSIGNED PRIMARY KEY,
         categoria_actual VARCHAR(50),
         producto_pendiente JSON,
         carrito JSON,
@@ -78,8 +78,8 @@ async function initDB() {
 
     await connection.query(`
       CREATE TABLE IF NOT EXISTS pedidos (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        usuario_id INT NOT NULL,
+        id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+        usuario_id BIGINT UNSIGNED NOT NULL,
         producto VARCHAR(255) NOT NULL,
         precio VARCHAR(50) NOT NULL,
         cantidad INT DEFAULT 1,
@@ -92,8 +92,8 @@ async function initDB() {
 
     await connection.query(`
       CREATE TABLE IF NOT EXISTS citas (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        usuario_id INT NOT NULL,
+        id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+        usuario_id BIGINT UNSIGNED NOT NULL,
         telefono VARCHAR(20) NOT NULL,
         nombre VARCHAR(100),
         dia VARCHAR(20),

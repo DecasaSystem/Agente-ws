@@ -761,26 +761,26 @@ function formatearPrecioFromDB(n) {
 }
 
 async function getInventarioFromDB() {
-  // Compatible con la tabla del sistema de ventas (Laravel):
-  //   categoria → subcategoria, precio_base → precio, foto_url → imagen
-  // Si la tabla usa el esquema anterior del agente (precio, imagen, subcategoria)
-  // también funciona gracias a los alias y el fallback de columnas.
   let rows;
   try {
+    // Esquema Laravel: precio_base, foto_url, categoria
     [rows] = await pool.query(
       `SELECT nombre,
-              COALESCE(precio_base, precio)   AS precio,
-              COALESCE(foto_url, imagen)       AS imagen,
+              precio_base AS precio,
+              foto_url    AS imagen,
               medidas, material,
-              COALESCE(categoria, subcategoria) AS subcategoria
+              categoria   AS subcategoria
+       FROM productos
+       WHERE activo = 1
+       ORDER BY categoria, nombre`
+    );
+  } catch {
+    // Fallback: esquema anterior del agente (precio, imagen, subcategoria)
+    [rows] = await pool.query(
+      `SELECT nombre, precio, imagen, medidas, material, subcategoria
        FROM productos
        WHERE activo IS NULL OR activo = 1
        ORDER BY subcategoria, nombre`
-    );
-  } catch {
-    // Fallback al esquema anterior (columnas del agente)
-    [rows] = await pool.query(
-      'SELECT nombre, precio, imagen, medidas, material, subcategoria FROM productos ORDER BY subcategoria, nombre'
     );
   }
 
