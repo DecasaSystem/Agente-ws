@@ -710,8 +710,8 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
           error: `No encontré imagen para "${nombre_producto}". Ese producto puede no tener foto disponible.`
         };
       }
-      // Actualizar último producto visto
-      await db.setUltimoProducto(from, { nombre: resultado.nombre, ts: Date.now() });
+      // Actualizar último producto visto (imagen incluida para visualización)
+      await db.setUltimoProducto(from, { nombre: resultado.nombre, imagen: resultado.imagen || null, ts: Date.now() });
       // No devolver el URL al modelo: evita que lo escriba en el texto como markdown
       return { exito: true, nombre: resultado.nombre, _imagenUrl: resultado.imagen, mensaje: `Foto de ${resultado.nombre} enviada al cliente.` };
     }

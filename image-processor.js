@@ -112,7 +112,7 @@ async function processRoomImage(mediaUrl, sofaInfo) {
 
     return { success: true, imageUrl: cloudinaryUrl };
   } catch (error) {
-    console.error('[IMG] Error:', error.message);
+    console.error('[IMG] Error composición:', error.message, error.stack?.split('\n')[1] || '');
     return { success: false, error: error.message };
   }
 }
