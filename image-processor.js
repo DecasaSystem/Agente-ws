@@ -41,16 +41,33 @@ async function uploadBase64ToCloudinary(b64) {
   });
 }
 
-async function processWithOpenAI(imageBuffer, furnitureDescription) {
-  const prompt = furnitureDescription
-    ? `Realistically place a ${furnitureDescription} in this room. Keep all existing furniture, lighting, shadows and perspective. The result must look like a real photo.`
-    : `Add a modern solid wood furniture piece in this room. Keep existing elements, lighting and perspective realistic.`;
+async function fetchBuffer(url) {
+  const { fetchWithTimeout } = require('./httpClient');
+  const res = await fetchWithTimeout(url);
+  if (!res.ok) throw new Error('Failed to fetch: ' + url);
+  return Buffer.from(await res.arrayBuffer());
+}
 
-  const imageFile = await toFile(imageBuffer, 'room.png', { type: 'image/png' });
+async function processWithOpenAI(roomBuffer, furnitureName, furnitureImageUrl) {
+  const roomFile = await toFile(roomBuffer, 'room.png', { type: 'image/png' });
+
+  let images = roomFile;
+  let prompt;
+
+  if (furnitureImageUrl) {
+    const prodBuffer = await fetchBuffer(furnitureImageUrl);
+    const prodFile = await toFile(prodBuffer, 'product.png', { type: 'image/png' });
+    images = [roomFile, prodFile];
+    prompt = `Place the furniture shown in the second image (reference product) into the room in the first image. Keep the exact same design, color, and style of the furniture as shown in the reference. Match the room's existing lighting, shadows, and perspective. The result must look like a real photo.`;
+  } else {
+    prompt = furnitureName
+      ? `Realistically place a ${furnitureName} in this room. Keep all existing furniture, lighting, shadows and perspective. The result must look like a real photo.`
+      : `Add a modern solid wood furniture piece in this room. Keep existing elements, lighting and perspective realistic.`;
+  }
 
   const response = await openai.images.edit({
     model: 'gpt-image-1',
-    image: imageFile,
+    image: images,
     prompt,
     n: 1,
     size: '1024x1024'
@@ -66,8 +83,9 @@ async function processRoomImage(mediaUrl, sofaInfo) {
     const imageBuffer = await downloadFromTwilio(mediaUrl);
 
     console.log('[IMG] Procesando con OpenAI gpt-image-1...');
-    const sofaDesc = sofaInfo ? (sofaInfo.descripcion || sofaInfo.nombre || null) : null;
-    const b64 = await processWithOpenAI(imageBuffer, sofaDesc);
+    const furnitureName = sofaInfo ? (sofaInfo.descripcion || sofaInfo.nombre || null) : null;
+    const furnitureImg  = sofaInfo ? (sofaInfo.imagen || null) : null;
+    const b64 = await processWithOpenAI(imageBuffer, furnitureName, furnitureImg);
 
     console.log('[IMG] Subiendo resultado a Cloudinary...');
     const cloudinaryUrl = await uploadBase64ToCloudinary(b64);

@@ -911,7 +911,7 @@ app.post('/webhook', async (req, res) => {
           // ── Replicate: superponer mueble en foto de sala ──────────
           const estado = await db.getEstado(from);
           const ultimoProd = estado.ultimo_producto;
-          const sofaInfo = ultimoProd ? { nombre: ultimoProd.nombre } : null;
+          const sofaInfo = ultimoProd ? { nombre: ultimoProd.nombre, imagen: ultimoProd.imagen || null } : null;
           const result = await processRoomImage(mediaUrl, sofaInfo);
           if (result.success) {
             await twilioClient.messages.create({
