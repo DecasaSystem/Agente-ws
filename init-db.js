@@ -18,7 +18,7 @@ async function initDB() {
     console.log(`✅ Conectado a base de datos '${dbName}'`);
 
     await connection.query(`
-      CREATE TABLE IF NOT EXISTS usuarios (
+      CREATE TABLE IF NOT EXISTS clientes_wa (
         id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
         telefono VARCHAR(20) UNIQUE NOT NULL,
         nombre VARCHAR(100),
@@ -26,17 +26,17 @@ async function initDB() {
         last_interaction DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
       )
     `);
-    const [colsUsuarios] = await connection.query('SHOW COLUMNS FROM usuarios');
+    const [colsUsuarios] = await connection.query('SHOW COLUMNS FROM clientes_wa');
     const nombresColsUsuarios = colsUsuarios.map(c => c.Field);
     if (!nombresColsUsuarios.includes('last_interaction')) {
-      await connection.query(`ALTER TABLE usuarios ADD COLUMN last_interaction DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP`);
-      console.log('✅ Columna last_interaction añadida a usuarios');
+      await connection.query(`ALTER TABLE clientes_wa ADD COLUMN last_interaction DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP`);
+      console.log('✅ Columna last_interaction añadida a clientes_wa');
     }
     if (!nombresColsUsuarios.includes('nombre')) {
-      await connection.query(`ALTER TABLE usuarios ADD COLUMN nombre VARCHAR(100)`);
-      console.log('✅ Columna nombre añadida a usuarios');
+      await connection.query(`ALTER TABLE clientes_wa ADD COLUMN nombre VARCHAR(100)`);
+      console.log('✅ Columna nombre añadida a clientes_wa');
     }
-    console.log('✅ Tabla usuarios creada o verificada');
+    console.log('✅ Tabla clientes_wa creada o verificada');
 
     await connection.query(`
       CREATE TABLE IF NOT EXISTS conversaciones (
@@ -45,7 +45,7 @@ async function initDB() {
         role ENUM('user', 'assistant') NOT NULL,
         contenido TEXT NOT NULL,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (usuario_id) REFERENCES usuarios(id) ON DELETE CASCADE,
+        FOREIGN KEY (usuario_id) REFERENCES clientes_wa(id) ON DELETE CASCADE,
         INDEX idx_usuario_fecha (usuario_id, created_at)
       )
     `);
@@ -66,7 +66,7 @@ async function initDB() {
         datos_agenda JSON,
         transferencia_medida_pendiente JSON,
         candidatos_pendientes JSON,
-        FOREIGN KEY (usuario_id) REFERENCES usuarios(id) ON DELETE CASCADE
+        FOREIGN KEY (usuario_id) REFERENCES clientes_wa(id) ON DELETE CASCADE
       )
     `);
     
@@ -95,7 +95,7 @@ async function initDB() {
         cantidad INT DEFAULT 1,
         estado ENUM('confirmado', 'entregado', 'cancelado') DEFAULT 'confirmado',
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (usuario_id) REFERENCES usuarios(id) ON DELETE CASCADE
+        FOREIGN KEY (usuario_id) REFERENCES clientes_wa(id) ON DELETE CASCADE
       )
     `);
     console.log('✅ Tabla pedidos creada o verificada');
@@ -112,7 +112,7 @@ async function initDB() {
         ubicacion INT,
         estado ENUM('pendiente', 'confirmada', 'cancelada') DEFAULT 'pendiente',
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (usuario_id) REFERENCES usuarios(id) ON DELETE CASCADE
+        FOREIGN KEY (usuario_id) REFERENCES clientes_wa(id) ON DELETE CASCADE
       )
     `);
     console.log('✅ Tabla citas creada o verificada');

@@ -1096,7 +1096,7 @@ app.get('/health', async (req, res) => {
   let usuarios = 0, pedidos = 0, citas = 0;
   try {
     const [[u], [p], [c]] = await Promise.all([
-      db.pool.query('SELECT COUNT(*) as c FROM usuarios'),
+      db.pool.query('SELECT COUNT(*) as c FROM clientes_wa'),
       db.pool.query('SELECT COUNT(*) as c FROM pedidos'),
       db.pool.query('SELECT COUNT(*) as c FROM citas')
     ]);
@@ -1129,9 +1129,9 @@ app.post('/citas/:id/estado', async (req, res) => {
 app.get('/admin/resumen', async (req, res) => {
   try {
     const [[pedidos], [citas], [usuarios]] = await Promise.all([
-      db.pool.query('SELECT p.id, u.telefono, p.producto, p.precio, p.cantidad, p.estado, p.created_at FROM pedidos p JOIN usuarios u ON p.usuario_id = u.id ORDER BY p.created_at DESC LIMIT 20'),
+      db.pool.query('SELECT p.id, u.telefono, p.producto, p.precio, p.cantidad, p.estado, p.created_at FROM pedidos p JOIN clientes_wa u ON p.usuario_id = u.id ORDER BY p.created_at DESC LIMIT 20'),
       db.pool.query('SELECT id, telefono, nombre, dia, hora, ubicacion, razon, estado, created_at FROM citas ORDER BY created_at DESC LIMIT 20'),
-      db.pool.query('SELECT COUNT(*) as total FROM usuarios')
+      db.pool.query('SELECT COUNT(*) as total FROM clientes_wa')
     ]);
     res.json({ usuarios: usuarios[0].total, pedidos, citas });
   } catch (e) {

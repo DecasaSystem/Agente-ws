@@ -39,24 +39,24 @@ async function getOrCreateUsuario(telefono) {
   const telefonoLimpio = telefono.replace('whatsapp:', '');
 
   const [usuarios] = await pool.query(
-    'SELECT * FROM usuarios WHERE telefono = ?',
+    'SELECT * FROM clientes_wa WHERE telefono = ?',
     [telefonoLimpio]
   );
 
   let usuario;
   if (usuarios.length > 0) {
     await pool.query(
-      'UPDATE usuarios SET last_interaction = NOW() WHERE id = ?',
+      'UPDATE clientes_wa SET last_interaction = NOW() WHERE id = ?',
       [usuarios[0].id]
     );
     usuario = usuarios[0];
   } else {
     const [result] = await pool.query(
-      'INSERT INTO usuarios (telefono, created_at, last_interaction) VALUES (?, NOW(), NOW())',
+      'INSERT INTO clientes_wa (telefono, created_at, last_interaction) VALUES (?, NOW(), NOW())',
       [telefonoLimpio]
     );
     const [nuevoUsuario] = await pool.query(
-      'SELECT * FROM usuarios WHERE id = ?',
+      'SELECT * FROM clientes_wa WHERE id = ?',
       [result.insertId]
     );
     usuario = nuevoUsuario[0];
@@ -84,7 +84,7 @@ async function getHistorial(telefono, limite = 12) {
   const telefonoLimpio = telefono.replace('whatsapp:', '');
 
   const [usuarios] = await pool.query(
-    'SELECT id FROM usuarios WHERE telefono = ?',
+    'SELECT id FROM clientes_wa WHERE telefono = ?',
     [telefonoLimpio]
   );
 
@@ -109,7 +109,7 @@ async function addMensaje(telefono, role, contenido) {
   const telefonoLimpio = telefono.replace('whatsapp:', '');
 
   const [usuarios] = await pool.query(
-    'SELECT id FROM usuarios WHERE telefono = ?',
+    'SELECT id FROM clientes_wa WHERE telefono = ?',
     [telefonoLimpio]
   );
 
@@ -135,7 +135,7 @@ async function getEstado(telefono) {
   const telefonoLimpio = telefono.replace('whatsapp:', '');
 
   const [usuarios] = await pool.query(
-    'SELECT id FROM usuarios WHERE telefono = ?',
+    'SELECT id FROM clientes_wa WHERE telefono = ?',
     [telefonoLimpio]
   );
 
@@ -198,7 +198,7 @@ async function updateEstado(telefono, datos) {
   const telefonoLimpio = telefono.replace('whatsapp:', '');
 
   const [usuarios] = await pool.query(
-    'SELECT id FROM usuarios WHERE telefono = ?',
+    'SELECT id FROM clientes_wa WHERE telefono = ?',
     [telefonoLimpio]
   );
 
@@ -444,7 +444,7 @@ async function guardarPedido(telefono, producto, precio, cantidad = 1) {
   const telefonoLimpio = telefono.replace('whatsapp:', '');
 
   const [usuarios] = await pool.query(
-    'SELECT id FROM usuarios WHERE telefono = ?',
+    'SELECT id FROM clientes_wa WHERE telefono = ?',
     [telefonoLimpio]
   );
 
@@ -462,7 +462,7 @@ async function getPedidos(telefono) {
   const telefonoLimpio = telefono.replace('whatsapp:', '');
 
   const [usuarios] = await pool.query(
-    'SELECT id FROM usuarios WHERE telefono = ?',
+    'SELECT id FROM clientes_wa WHERE telefono = ?',
     [telefonoLimpio]
   );
 
@@ -480,7 +480,7 @@ async function tienePedido(telefono) {
   const telefonoLimpio = telefono.replace('whatsapp:', '');
 
   const [usuarios] = await pool.query(
-    'SELECT id FROM usuarios WHERE telefono = ?',
+    'SELECT id FROM clientes_wa WHERE telefono = ?',
     [telefonoLimpio]
   );
 
@@ -546,7 +546,7 @@ async function guardarCita(telefono, datos) {
   const telefonoLimpio = telefono.replace('whatsapp:', '');
 
   const [usuarios] = await pool.query(
-    'SELECT id FROM usuarios WHERE telefono = ?',
+    'SELECT id FROM clientes_wa WHERE telefono = ?',
     [telefonoLimpio]
   );
 
@@ -570,7 +570,7 @@ async function limpiarConversaciones(telefono) {
   const telefonoLimpio = telefono.replace('whatsapp:', '');
 
   const [usuarios] = await pool.query(
-    'SELECT id FROM usuarios WHERE telefono = ?',
+    'SELECT id FROM clientes_wa WHERE telefono = ?',
     [telefonoLimpio]
   );
 
@@ -606,7 +606,7 @@ async function verificarYLimpiarInactividad(telefono, timeoutMinutos = TIMEOUT_I
   const telefonoLimpio = telefono.replace('whatsapp:', '');
 
   const [usuarios] = await pool.query(
-    'SELECT id, last_interaction FROM usuarios WHERE telefono = ?',
+    'SELECT id, last_interaction FROM clientes_wa WHERE telefono = ?',
     [telefonoLimpio]
   );
 
@@ -634,14 +634,14 @@ async function actualizarLastInteraction(telefono) {
   const telefonoLimpio = telefono.replace('whatsapp:', '');
 
   const [usuarios] = await pool.query(
-    'SELECT id FROM usuarios WHERE telefono = ?',
+    'SELECT id FROM clientes_wa WHERE telefono = ?',
     [telefonoLimpio]
   );
 
   if (usuarios.length === 0) return;
 
   await pool.query(
-    'UPDATE usuarios SET last_interaction = NOW() WHERE id = ?',
+    'UPDATE clientes_wa SET last_interaction = NOW() WHERE id = ?',
     [usuarios[0].id]
   );
 }
@@ -649,7 +649,7 @@ async function actualizarLastInteraction(telefono) {
 async function limpiarConversacionesInactivas(timeoutMinutos = TIMEOUT_INACTIVIDAD_MINUTOS) {
   try {
     const [usuarios] = await pool.query(
-      `SELECT telefono FROM usuarios 
+      `SELECT telefono FROM clientes_wa 
        WHERE last_interaction < NOW() - INTERVAL ? MINUTE`,
       [timeoutMinutos]
     );
