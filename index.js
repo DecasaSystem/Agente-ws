@@ -920,10 +920,49 @@ app.post('/webhook', async (req, res) => {
               mediaUrl: [result.imageUrl]
             });
           } else {
+            // Replicate sin crédito u otro error: caer al flujo Vision
+            // para al menos mostrar opciones del catálogo con fotos
             await twilioClient.messages.create({
               from: toNumber, to: from,
-              body: result.message || '¡Recibí tu foto! Por ahora no pude procesarla. ¿Qué tipo de mueble buscas? 😊'
+              body: 'La visualización en tu espacio no está disponible ahora mismo 🛠️ Pero te muestro las mejores opciones de nuestro catálogo con fotos:'
             });
+            // Reutilizar el flujo Vision con la misma imagen
+            mediaUrl && (async () => {
+              try {
+                const { downloadFromTwilio } = require('./image-processor');
+                const imageBuffer = await downloadFromTwilio(mediaUrl);
+                const base64 = imageBuffer.toString('base64');
+                const mime = (mediaType || 'image/jpeg').split(';')[0];
+                const historial = await db.getHistorial(from, 6);
+                const msgs = [
+                  { role: 'system', content: SYSTEM_PROMPT },
+                  ...historial.map(m => ({ role: m.role, content: m.content })),
+                  { role: 'user', content: [
+                    { type: 'image_url', image_url: { url: `data:${mime};base64,${base64}`, detail: 'low' } },
+                    { type: 'text', text: (incomingMsg || 'El cliente quiere ver opciones de muebles similares.') + '\n\nIdentifica el tipo de mueble y muestra opciones del catálogo con fotos.' }
+                  ]}
+                ];
+                for (let r = 0; r < 5; r++) {
+                  const rv = await openai.chat.completions.create({ model: MODEL, messages: msgs, tools: TOOLS, tool_choice: 'auto', temperature: 0.7, max_tokens: 800 });
+                  const cv = rv.choices[0];
+                  if (cv.finish_reason === 'tool_calls' && cv.message.tool_calls) {
+                    msgs.push({ role: 'assistant', content: cv.message.content || null, tool_calls: cv.message.tool_calls });
+                    for (const tc of cv.message.tool_calls) {
+                      let args = {}; try { args = JSON.parse(tc.function.arguments); } catch {}
+                      const toolRes = await ejecutarHerramienta(tc.function.name, args, from, historial);
+                      if (tc.function.name === 'enviar_foto' && toolRes.exito && toolRes._imagenUrl) {
+                        await twilioClient.messages.create({ from: toNumber, to: from, body: `📸 ${toolRes.nombre}`, mediaUrl: [toolRes._imagenUrl] });
+                      }
+                      msgs.push({ role: 'tool', tool_call_id: tc.id, content: JSON.stringify(toolRes) });
+                    }
+                  } else {
+                    const texto = cv.message.content || '¿Alguna te llama la atención?';
+                    await twilioClient.messages.create({ from: toNumber, to: from, body: texto });
+                    break;
+                  }
+                }
+              } catch (visionErr) { console.error('[VISION-FALLBACK]', visionErr.message); }
+            })();
           }
 
         } else {
