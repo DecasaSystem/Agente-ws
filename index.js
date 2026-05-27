@@ -205,7 +205,7 @@ async function enviarMensajeAdicional(from, toNumber, body, mediaUrl) {
     if (mediaUrl) msg.mediaUrl = [mediaUrl];
     await twilioClient.messages.create(msg);
   } catch (e) {
-    console.error('[TWILIO] Error enviando mensaje adicional:', e.message);
+    console.error('[TWILIO] Error enviando mensaje adicional:', e.message, e.code || '', e.status || '');
   }
 }
 
