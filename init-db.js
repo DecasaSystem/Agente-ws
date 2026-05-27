@@ -26,6 +26,16 @@ async function initDB() {
         last_interaction DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
       )
     `);
+    const [colsUsuarios] = await connection.query('SHOW COLUMNS FROM usuarios');
+    const nombresColsUsuarios = colsUsuarios.map(c => c.Field);
+    if (!nombresColsUsuarios.includes('last_interaction')) {
+      await connection.query(`ALTER TABLE usuarios ADD COLUMN last_interaction DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP`);
+      console.log('✅ Columna last_interaction añadida a usuarios');
+    }
+    if (!nombresColsUsuarios.includes('nombre')) {
+      await connection.query(`ALTER TABLE usuarios ADD COLUMN nombre VARCHAR(100)`);
+      console.log('✅ Columna nombre añadida a usuarios');
+    }
     console.log('✅ Tabla usuarios creada o verificada');
 
     await connection.query(`
