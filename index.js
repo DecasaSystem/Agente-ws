@@ -150,6 +150,16 @@ const UBICACIONES = {
   5: 'Cra. 14 #11 - 93, Pereira, Risaralda'
 };
 
+const SEDE_NOMBRE = {
+  1: 'Decasa Bolívar (Armenia)',
+  2: 'Decasa Vía El Edén (Armenia)',
+  3: 'Decasa Vía Jardines (Armenia)',
+  4: 'Decasa Unicentro Pereira',
+  5: 'Decasa Risaralda (Pereira)',
+};
+
+const SEDE_TIENDA_ID = { 1: 1, 2: 2, 3: 3, 4: 4, 5: 5 };
+
 // ─── NOTIFICACIONES → SISTEMA DE VENTAS DECASA ───────────────────────────────
 
 async function enviarNotificacionTelegram(telefono, mensaje, historial, tipo = 'asesor', extra = {}) {
@@ -182,6 +192,11 @@ async function enviarNotificacionTelegram(telefono, mensaje, historial, tipo = '
     resumen:        resumen,
     historial:      (historial || []).slice(-8).map(m => ({ role: m.role, content: String(m.content).substring(0, 150) })),
     whatsapp_url:   whatsappUrl,
+    contacto_url:   whatsappUrl,
+    fuente:         'whatsapp',
+    ...(extra.carrito    && { carrito:    extra.carrito }),
+    ...(extra.datos_cita && { datos_cita: extra.datos_cita }),
+    ...(extra.tienda_id  && { tienda_id:  extra.tienda_id }),
   };
 
   try {
@@ -365,7 +380,14 @@ REGLAS DE VENTA:
 - Cuando muestres productos incluye precio, material y medidas
 
 FLUJO DE AGENDAMIENTO:
-Pide en orden: nombre completo → sede (muestra las 5 opciones) → día → hora → motivo. Cuando tengas todo, llama agendar_cita. Extrae solo el nombre sin frases como "me llamo" o "mi nombre es".
+Pide en orden: nombre completo → sede → día → hora. El motivo es OPCIONAL: solo inclúyelo si el cliente lo menciona, NUNCA lo inventes ni lo inferas del contexto.
+Al pedir la sede, SIEMPRE muestra la lista completa:
+  1. Av. Bolívar # 16 N 26, Armenia
+  2. Km 2 vía El Edén, Armenia
+  3. Km 1 vía Jardines, Armenia
+  4. Unicentro Pereira
+  5. Risaralda Pereira
+Cuando tengas nombre, sede, día y hora llama agendar_cita. Extrae solo el nombre sin frases como "me llamo" o "mi nombre es". Después de confirmar la cita, pregunta si hay algo más en lo que puedas ayudar.
 
 FLUJO DE COMPARACIÓN:
 Cuando el cliente quiera comparar dos productos: llama buscar_productos para cada uno, presenta la comparación y luego llama enviar_foto dos veces (una por producto) para enviar ambas imágenes.
@@ -514,9 +536,9 @@ const TOOLS = [
           ubicacion: { type: 'number', description: 'Número de sede (1-5)' },
           dia: { type: 'string', description: 'Día de la semana (Lunes, Martes, Miercoles, Jueves, Viernes, Sabado)' },
           hora: { type: 'string', description: 'Hora en formato HH:MM (ej: "14:00", "09:30")' },
-          motivo: { type: 'string', description: 'Motivo de la visita' }
+          motivo: { type: 'string', description: 'Motivo de la visita (opcional, solo si el cliente lo menciona)' }
         },
-        required: ['nombre', 'ubicacion', 'dia', 'hora', 'motivo']
+        required: ['nombre', 'ubicacion', 'dia', 'hora']
       }
     }
   },
@@ -699,7 +721,7 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
       }
       await db.marcarPedidoConfirmado(from);
       await db.resetearEstadoSinPedido(from);
-      await enviarNotificacionTelegram(telefono, 'Pedido confirmado via bot', historial, 'pedido');
+      await enviarNotificacionTelegram(telefono, resumenItems.join('\n'), historial, 'pedido', { carrito: items });
       await db.limpiarConversaciones(from);
       return {
         exito: true, resumen: resumenItems.join('\n'),
@@ -773,15 +795,24 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
         dia: diaCapitalizado, hora: horaFormateada, razon: motivo
       });
 
-      const msgTelegram = `📅 NUEVA CITA\n👤 ${nombreLimpio} (${telefono})\n📅 ${diaCapitalizado} ${horaFormateada}\n📍 ${UBICACIONES[Number(ubicacion)]}\n📝 ${motivo}`;
-      await enviarNotificacionTelegram(telefono, msgTelegram, historial, 'cita');
+      const sedeNombre = SEDE_NOMBRE[Number(ubicacion)] ?? UBICACIONES[Number(ubicacion)]
+      const tiendaId   = SEDE_TIENDA_ID[Number(ubicacion)] ?? null
+      const motivoFinal = motivo || null
+      const datosCita  = { nombre: nombreLimpio, ubicacion: Number(ubicacion), sede_nombre: sedeNombre, dia: diaCapitalizado, hora: horaFormateada, motivo: motivoFinal }
 
+      const resumenCita = `${nombreLimpio} — ${sedeNombre} — ${diaCapitalizado} ${horaFormateada}${motivoFinal ? ` — ${motivoFinal}` : ''}`
+      await enviarNotificacionTelegram(
+        telefono,
+        resumenCita,
+        historial,
+        'cita',
+        { datos_cita: datosCita, tienda_id: tiendaId, nombre: nombreLimpio }
+      );
+
+      const lineaMotivo = motivoFinal ? `\nMotivo: ${motivoFinal}` : ''
       return {
         exito: true,
-        cita: {
-          nombre: nombreLimpio, sede: `${ubicacion}. ${UBICACIONES[Number(ubicacion)]}`,
-          dia: diaCapitalizado, hora: horaFormateada, motivo
-        }
+        mensaje: `¡Listo! Tu cita quedó agendada ✅\n\n👤 *${nombreLimpio}*\n📍 ${sedeNombre}\n📅 ${diaCapitalizado} a las ${horaFormateada}${lineaMotivo}\n\nNuestro equipo te confirmará la visita pronto 😊\n\n¿Hay algo más en lo que pueda ayudarte?`
       };
     }
 
