@@ -1125,12 +1125,18 @@ NUNCA digas que no puedes identificar productos. Clasifica el tipo y muestra el 
 
     // ── USUARIO TRANSFERIDO A ASESOR ───────────────────────────────
     if (await db.estaTransferida(from)) {
-      const twiml = new MessagingResponse();
-      twiml.message('✅ Tu mensaje fue recibido. El asesor te responderá pronto. 😊');
-      res.type('text/xml').send(twiml.toString());
-      const historialTelegram = await db.getHistorial(from, 6);
-      enviarNotificacionTelegram(from.replace('whatsapp:', ''), incomingMsg, historialTelegram).catch(() => {});
-      return;
+      // Si el mensaje es claramente para el bot (citas, productos, bot) → resetear y dejar pasar al AI
+      const esParaBot = /\b(agendar|cita|visita|producto|mueble|precio|cat[aá]logo|ver|mostrar|buscar|quiero|necesito|tengo|tendr[íi]a|carrito|comprar|sofá|sofa|silla|mesa|cama|colch[oó]n|armario|agente|bot|elena)\b/i.test(msgLow);
+      if (esParaBot) {
+        await db.updateEstado(from, { transferido: false });
+      } else {
+        const twiml = new MessagingResponse();
+        twiml.message('✅ Tu mensaje fue recibido. El asesor te responderá pronto. 😊');
+        res.type('text/xml').send(twiml.toString());
+        const historialTelegram = await db.getHistorial(from, 6);
+        enviarNotificacionTelegram(from.replace('whatsapp:', ''), incomingMsg, historialTelegram).catch(() => {});
+        return;
+      }
     }
 
     // ── LLAMADA A OPENAI CON TIMEOUT ───────────────────────────────
