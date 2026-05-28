@@ -589,6 +589,7 @@ async function resetearEstadoSinPedido(telefono) {
     categoria_actual: null,
     producto_pendiente: null,
     carrito: [],
+    transferido: false,
     greeting_sent: false,
     tiene_pedido: false,
     agendando_cita: false,

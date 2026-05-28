@@ -1114,6 +1114,8 @@ NUNCA digas que no puedes identificar productos. Clasifica el tipo y muestra el 
     const esSoloSaludo = /^(hola|holis|holi|holaa|holaaa|buenas?|buenos\s*(dias?|tardes?|noches?)|que\s*tal|hi\b|hello\b|hey\b|saludos|como\s*est[aá]s?)[\s!.]*$/.test(msgLow);
 
     if (esSoloSaludo) {
+      // Reset transferido para que el usuario pueda retomar el chat con el bot
+      await db.updateEstado(from, { transferido: false });
       const twiml = new MessagingResponse();
       twiml.message(SALUDO_INICIAL);
       await db.addMensaje(from, 'user', incomingMsg);
