@@ -348,7 +348,7 @@ CUÁNDO TRANSFERIR AL ASESOR (llama transferir_asesor INMEDIATAMENTE):
 - El cliente lleva 2+ mensajes con la misma duda sin resolución
 - El cliente expresa frustración ("no me ayudas", "no entiendes", "esto no sirve")
 - Hay una pregunta que no puedes responder con certeza
-Al transferir: dile al cliente que un asesor humano lo contactará pronto y despídete amablemente.
+Al transferir: dile al cliente que un asesor humano lo contactará pronto y despídete amablemente. Si el resultado incluye aviso_horario con texto, inclúyelo literalmente en tu respuesta.
 
 TÉRMINOS AMBIGUOS — pregunta ANTES de buscar:
 - "sillas" → pregunta: "¿Buscas sillas de comedor, sillas auxiliares (para sala o decoración) o sillas de barra?"
@@ -535,6 +535,13 @@ const TOOLS = [
     }
   }
 ];
+
+function avisoHorarioTarde() {
+  const h = parseInt(new Date().toLocaleString('en-US', { timeZone: 'America/Bogota', hour: 'numeric', hour12: false }))
+  return (h >= 21 || h < 8)
+    ? 'Ya es tarde (después de las 9pm). Avisa al cliente que el asesor puede que le responda mañana, pero que harán su mejor esfuerzo. Agradece su paciencia.'
+    : null
+}
 
 // ─── EJECUTAR HERRAMIENTAS ────────────────────────────────────────────────────
 
@@ -783,7 +790,8 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
       await enviarNotificacionTelegram(telefono, razon || 'Solicitud de asesor', historial, 'asesor');
       await db.marcarTransferida(from);
       await db.limpiarConversaciones(from);
-      return { exito: true, mensaje: 'Asesor notificado vía Telegram.' };
+      const aviso = avisoHorarioTarde()
+      return { exito: true, mensaje: 'Asesor notificado.', aviso_horario: aviso };
     }
 
     default:
