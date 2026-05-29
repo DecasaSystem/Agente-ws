@@ -101,7 +101,7 @@ async function initDB() {
     console.log('✅ Tabla pedidos creada o verificada');
 
     await connection.query(`
-      CREATE TABLE IF NOT EXISTS citas (
+      CREATE TABLE IF NOT EXISTS citas_agentes (
         id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
         usuario_id BIGINT UNSIGNED NOT NULL,
         telefono VARCHAR(20) NOT NULL,
@@ -115,7 +115,7 @@ async function initDB() {
         FOREIGN KEY (usuario_id) REFERENCES clientes_wa(id) ON DELETE CASCADE
       )
     `);
-    console.log('✅ Tabla citas creada o verificada');
+    console.log('✅ Tabla citas_agentes creada o verificada');
 
     const [colsEstado] = await connection.query('SHOW COLUMNS FROM estado_usuario');
     const nombresColsEstado = colsEstado.map(c => c.Field);

@@ -553,7 +553,7 @@ async function guardarCita(telefono, datos) {
   if (usuarios.length === 0) return false;
 
   await pool.query(
-    `INSERT INTO citas (usuario_id, telefono, nombre, dia, hora, razon, ubicacion) 
+    `INSERT INTO citas_agentes (usuario_id, telefono, nombre, dia, hora, razon, ubicacion)
      VALUES (?, ?, ?, ?, ?, ?, ?)`,
     [usuarios[0].id, telefonoLimpio, datos.nombre, datos.dia, datos.hora, datos.razon, datos.ubicacion]
   );
