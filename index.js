@@ -230,7 +230,7 @@ async function enviarMensajeAdicional(from, toNumber, body, mediaUrl) {
 
 function buscarEnInventario(consulta, categoria, limite = 6) {
   const q = normalizarTexto(consulta);
-  const palabras = q.split(/\s+/).filter(p => p.length > 2);
+  const palabras = q.split(/\s+/).filter(p => p.length >= 2);
 
   const cats = categoria && inventario[categoria]
     ? { [categoria]: inventario[categoria] }
@@ -307,7 +307,7 @@ function buscarEnInventarioPorPresupuesto(presupuestoMax, categoria, limite = 5)
 
 function buscarImagenProducto(nombreProducto) {
   const q = normalizarTexto(nombreProducto);
-  const palabras = q.split(/\s+/).filter(p => p.length > 2);
+  const palabras = q.split(/\s+/).filter(p => p.length >= 2);
 
   let mejor = null, mejorScore = 0;
   for (const catData of Object.values(inventario)) {
