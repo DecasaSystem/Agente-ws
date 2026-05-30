@@ -1,4 +1,4 @@
-'use strict';
+﻿'use strict';
 
 function alertarTelegramCrash(tipo, err) {
   const token = process.env.TELEGRAM_BOT_TOKEN;
@@ -136,7 +136,9 @@ function formatearMoneda(valor) {
 // Normaliza texto para búsquedas (elimina acentos, caracteres especiales)
 function normalizarTexto(texto) {
   return String(texto || '').toLowerCase()
-    .normalize('NFD').replace(/[̀-ͯ]/g, '')
+    .replace(/[aáàäâ]/g, 'a').replace(/[eéèëê]/g, 'e')
+    .replace(/[iíìïî]/g, 'i').replace(/[oóòöô]/g, 'o')
+    .replace(/[uúùüû]/g, 'u').replace(/[ñ]/g, 'n')
     .replace(/[^a-z0-9\s]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
@@ -691,7 +693,14 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
       }
       const existe = items.find(i => i.producto.toLowerCase() === producto.toLowerCase());
       if (existe) {
-        return { exito: false, error: `"${producto}" ya está en el carrito.` };
+        const nuevaCantidad = Number(cantidad) || existe.cantidad || 1;
+        existe.cantidad = nuevaCantidad;
+        await db.updateEstado(from, { carrito: items });
+        const total = items.reduce((s, i) => s + parsearPrecio(i.precio) * (i.cantidad || 1), 0);
+        return {
+          exito: true, mensaje: `Cantidad de "${producto}" actualizada a ${nuevaCantidad} unidad${nuevaCantidad > 1 ? 'es' : ''}.`,
+          items_en_carrito: items.length, total_carrito: formatearMoneda(total)
+        };
       }
       // Guardar también como último producto visto
       await db.setUltimoProducto(from, { nombre: producto, precio, ts: Date.now() });
@@ -763,11 +772,12 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
 
     case 'enviar_catalogo': {
       const { categoria } = args;
-      const url = catalogosDB[categoria];
+      const catNorm = normalizarTexto(categoria).replace(/\s+/g, '_');
+      const url = catalogosDB[catNorm] ?? catalogosDB[categoria];
       if (!url) {
-        const entrada = Object.entries(catalogosDB).find(([k]) =>
-          k.includes(categoria) || categoria.includes(k)
-        );
+        // Primero buscar por prefijo exacto, luego por substring (evita confundir sofas con sofas_modulares)
+        const entrada = Object.entries(catalogosDB).find(([k]) => k === catNorm)
+          ?? Object.entries(catalogosDB).find(([k]) => k.startsWith(catNorm) || catNorm.startsWith(k));
         if (entrada) return { exito: true, url: entrada[1], categoria: entrada[0] };
         return {
           exito: false,
@@ -796,7 +806,7 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
       }
       const h = parseInt(horaMatch[1]);
       const esSabado = diaLimpio.includes('sabado');
-      const horaMax = esSabado ? 11 : 16;
+      const horaMax = esSabado ? 11 : 17;
       if (h < 8 || h > horaMax) {
         return { exito: false, error: `Hora fuera de horario. ${esSabado ? 'Sábado: 8am-12pm.' : 'Lunes-Viernes: 8am-5pm.'}` };
       }
