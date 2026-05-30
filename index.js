@@ -757,7 +757,9 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
       }
       await db.marcarPedidoConfirmado(from);
       await db.resetearEstadoSinPedido(from);
-      await enviarNotificacionTelegram(telefono, resumenItems.join('\n'), historial, 'pedido', { carrito: items });
+      enviarNotificacionTelegram(telefono, resumenItems.join('\n'), historial, 'pedido', { carrito: items }).catch(e =>
+        console.error('[REDES] Error notificacion pedido:', e.message)
+      );
       await db.limpiarConversaciones(from);
       // Mensaje de confirmación con resumen exacto — el campo 'mensaje_enviado' le indica a la IA que no lo repita
       return {

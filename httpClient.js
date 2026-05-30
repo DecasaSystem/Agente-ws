@@ -8,6 +8,10 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 10000) {
       signal: controller.signal
     });
     clearTimeout(timeout);
+    if (!response.ok) {
+      const body = await response.text().catch(() => '');
+      throw new Error(`HTTP ${response.status} ${response.statusText}: ${body.substring(0, 300)}`);
+    }
     return response;
   } catch (error) {
     clearTimeout(timeout);
