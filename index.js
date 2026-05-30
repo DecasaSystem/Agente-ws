@@ -206,7 +206,7 @@ async function enviarNotificacionTelegram(telefono, mensaje, historial, tipo = '
       method:  'POST',
       headers: { 'Content-Type': 'application/json', 'X-Agent-Token': apiToken || '' },
       body:    JSON.stringify(payload)
-    }, 2, 10000);
+    }, 2, 25000);
     console.log(`[REDES] Notificación ${tipo} enviada al sistema`);
   } catch (e) {
     console.error('[REDES] Error enviando notificación:', e.message);
@@ -679,6 +679,17 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
         total += precio * cant;
         return { producto: item.producto, precio: item.precio, cantidad: cant };
       });
+      // Notificar al sistema de ventas cuando hay carrito activo
+      const resumenCarrito = itemsFormateados.map((i, idx) =>
+        `${idx + 1}. ${i.producto} × ${i.cantidad} — ${i.precio}`
+      ).join('\n');
+      enviarNotificacionTelegram(
+        telefono,
+        `Carrito activo:\n${resumenCarrito}\nTotal: ${formatearMoneda(total)}`,
+        historial,
+        'asesor',
+        { carrito: itemsFormateados }
+      ).catch(() => {});
       return {
         items: itemsFormateados, total: formatearMoneda(total),
         totalNumerico: total, cantidad_items: items.length
