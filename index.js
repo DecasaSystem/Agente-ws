@@ -759,10 +759,13 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
       await db.resetearEstadoSinPedido(from);
       await enviarNotificacionTelegram(telefono, resumenItems.join('\n'), historial, 'pedido', { carrito: items });
       await db.limpiarConversaciones(from);
+      // Mensaje de confirmación con resumen exacto — el campo 'mensaje_enviado' le indica a la IA que no lo repita
       return {
-        exito: true, resumen: resumenItems.join('\n'),
+        exito: true,
+        resumen: resumenItems.join('\n'),
         total: formatearMoneda(total),
-        mensaje: 'Pedido registrado. Un asesor te contactará para confirmar entrega y pago.'
+        mensaje_confirmacion: `¡Pedido confirmado! 🎉\n\n${resumenItems.join('\n')}\n\n*Total: ${formatearMoneda(total)}*\n\nUn asesor de DeCasa te contactará pronto para coordinar el pago y la entrega. ¡Gracias por elegir DeCasa! 😊`,
+        instruccion_ia: 'Comparte el mensaje_confirmacion tal cual al cliente, sin cambiar nada. Luego solo añade una frase corta de despedida.'
       };
     }
 
