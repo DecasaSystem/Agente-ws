@@ -1136,6 +1136,57 @@ NUNCA digas que no puedes identificar productos. Clasifica el tipo y muestra el 
       return;
     }
 
+    // ── AUDIO RECIBIDO DEL CLIENTE ──────────────────────────────
+    if (mediaUrl && mediaType?.startsWith('audio/')) {
+      const twiml = new MessagingResponse();
+      twiml.message('🎧 Escuché tu audio, un momento...');
+      res.type('text/xml').send(twiml.toString());
+
+      try {
+        const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+        const { downloadFromTwilio } = require('./image-processor');
+        const { toFile } = require('openai');
+        const audioBuffer = await downloadFromTwilio(mediaUrl);
+        const mimeClean = (mediaType || 'audio/ogg').split(';')[0];
+        const ext = mimeClean.split('/')[1] || 'ogg';
+        const audioFile = await toFile(audioBuffer, `audio.${ext}`, { type: mimeClean });
+
+        const transcripcion = await openai.audio.transcriptions.create({
+          model: 'whisper-1',
+          file: audioFile,
+          language: 'es',
+        });
+
+        const textoTranscrito = transcripcion.text?.trim();
+        if (!textoTranscrito) {
+          await twilioClient.messages.create({ from: toNumber, to: from, body: 'No pude entender el audio. ¿Podrías escribir tu consulta? 😊' });
+          return;
+        }
+
+        console.log(`[AUDIO→TEXTO] ${from}: ${textoTranscrito}`);
+
+        const historialAudio = await db.getHistorial(from, 12);
+        const resultadoAudio = await callOpenAI(from, textoTranscrito, historialAudio);
+
+        await db.addMensaje(from, 'user', `🎤 ${textoTranscrito}`);
+        await db.addMensaje(from, 'assistant', resultadoAudio.texto);
+        await db.actualizarLastInteraction(from);
+
+        await twilioClient.messages.create({ from: toNumber, to: from, body: resultadoAudio.texto });
+        for (const img of resultadoAudio.imagenesParaEnviar) {
+          const caption = img.esCatalogo ? '' : `📸 ${img.nombre}`;
+          await enviarMensajeAdicional(from, toNumber, caption, img.url);
+        }
+      } catch (err) {
+        console.error('[AUDIO] Error:', err.message);
+        try {
+          const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+          await twilioClient.messages.create({ from: toNumber, to: from, body: 'No pude procesar tu audio. ¿Puedes escribir tu consulta? 😊' });
+        } catch {}
+      }
+      return;
+    }
+
     // ── SALUDO PURO ────────────────────────────────────────────────
     const msgLow = incomingMsg.toLowerCase();
     const esSoloSaludo = /^(hola|holis|holi|holaa|holaaa|buenas?|buenos\s*(dias?|tardes?|noches?)|que\s*tal|hi\b|hello\b|hey\b|saludos|como\s*est[aá]s?)[\s!.]*$/.test(msgLow);
