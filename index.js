@@ -644,7 +644,7 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
       let citasRecientes = [];
       try {
         const [citas] = await db.pool.query(
-          'SELECT nombre, dia, hora, ubicacion, razon, estado FROM citas WHERE telefono = ? ORDER BY created_at DESC LIMIT 3',
+          'SELECT nombre, dia, hora, ubicacion, razon, estado FROM citas_agentes WHERE telefono = ? ORDER BY created_at DESC LIMIT 3',
           [telefono]
         );
         citasRecientes = citas.map(c => ({
