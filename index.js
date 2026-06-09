@@ -159,19 +159,19 @@ function normalizarTexto(texto) {
 }
 
 const UBICACIONES = {
-  1: 'Av. Bolívar # 16 N 26, Armenia, Quindío',
+  1: 'Avenida Bolívar # 16 N 26, Armenia, Quindío',
   2: 'Km 2 vía El Edén, Armenia, Quindío',
   3: 'Km 1 vía Jardines, Armenia, Quindío',
-  4: 'CC Unicentro Pereira, Risaralda',
-  5: 'Cra. 14 #11 - 93, Pereira, Risaralda'
+  4: 'C.C. Unicentro, Pereira, Risaralda',
+  5: 'Cra. 14 #11-93, Pereira, Risaralda'
 };
 
 const SEDE_NOMBRE = {
-  1: 'Decasa Bolívar (Armenia)',
-  2: 'Decasa Vía El Edén (Armenia)',
-  3: 'Decasa Vía Jardines (Armenia)',
-  4: 'Decasa Unicentro Pereira',
-  5: 'Decasa Risaralda (Pereira)',
+  1: 'Decasa Bolívar — Av. Bolívar # 16 N 26, Armenia',
+  2: 'Decasa Vía El Edén — Km 2 vía El Edén, Armenia',
+  3: 'Decasa Vía Jardines — Km 1 vía Jardines, Armenia',
+  4: 'Decasa Unicentro — C.C. Unicentro, Pereira',
+  5: 'Decasa Circunvalar — Cra. 14 #11-93, Pereira',
 };
 
 const SEDE_TIENDA_ID = { 1: 1, 2: 2, 3: 3, 4: 4, 5: 5 };
@@ -349,11 +349,11 @@ IDENTIDAD:
 - Instagram: @muebles_decasa
 
 SEDES (usa el número en agendar_cita):
-1. Av. Bolívar # 16 N 26, Armenia, Quindío
+1. Avenida Bolívar # 16 N 26, Armenia, Quindío
 2. Km 2 vía El Edén, Armenia, Quindío
 3. Km 1 vía Jardines, Armenia, Quindío
-4. CC Unicentro Pereira, Risaralda
-5. Cra. 14 #11 - 93, Pereira, Risaralda
+4. C.C. Unicentro, Pereira, Risaralda
+5. Cra. 14 #11-93, Pereira, Risaralda
 
 CATEGORÍAS DE PRODUCTOS:
 camas | bases_comedores | sillas_comedor | sillas_auxiliares | sillas_barra
@@ -425,11 +425,11 @@ Pide en orden: nombre completo → sede → fecha exacta → hora. El motivo es 
 Para la fecha pide el DÍA DE LA SEMANA y la FECHA (ej: "martes 3 de junio", "viernes 20 de junio"). No aceptes solo el nombre del día sin número de fecha.
 El motivo es OPCIONAL: pregúntalo una sola vez ("¿Tienes algún producto o motivo de visita? (no es obligatorio)") — si no quiere darlo, llama agendar_cita igual. NUNCA inventes ni inferras el motivo del contexto.
 Al pedir la sede, SIEMPRE muestra la lista completa:
-  1. Av. Bolívar # 16 N 26, Armenia
+  1. Avenida Bolívar # 16 N 26, Armenia
   2. Km 2 vía El Edén, Armenia
   3. Km 1 vía Jardines, Armenia
-  4. Unicentro Pereira
-  5. Risaralda Pereira
+  4. C.C. Unicentro, Pereira
+  5. Cra. 14 #11-93, Pereira
 Cuando tengas nombre, sede, fecha y hora llama agendar_cita. Extrae solo el nombre sin frases como "me llamo" o "mi nombre es". Después de confirmar la cita, pregunta si hay algo más en lo que puedas ayudar.
 
 FLUJO DE COMPARACIÓN:
