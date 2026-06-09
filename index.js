@@ -391,6 +391,15 @@ CUÁNDO TRANSFERIR AL ASESOR (llama transferir_asesor INMEDIATAMENTE):
 - El cliente expresa frustración ("no me ayudas", "no entiendes", "esto no sirve")
 - Hay una pregunta que no puedes responder con certeza
 Al transferir: dile al cliente que un asesor humano lo contactará pronto y despídete amablemente. Si el resultado incluye aviso_horario con texto, inclúyelo literalmente en tu respuesta.
+El campo 'razon' de transferir_asesor debe ser un resumen claro en 1-2 líneas para el vendedor. Incluye siempre:
+• Qué quiere el cliente: comprar en tienda / que lo fabriquen / personalizar / consultar envío / otro
+• Nombre exacto del producto de interés (si lo mencionó)
+• Si llamaste consultar_disponibilidad: indica el resultado (ej: "hay 2 und en Decasa Edén" o "sin stock, fabricar")
+Ejemplos correctos:
+- "Quiere comprar Sofá Medellín 3P. Hay 2 und en Decasa Edén. Pregunta por envío a Calarcá."
+- "Quiere que le fabriquen Cama Lisboa 2P (sin stock en tiendas)."
+- "Quiere personalizar Sofá Roma con tela verde y patas negras."
+- "Pregunta por costo de envío para Silla Cali a Manizales."
 
 TÉRMINOS AMBIGUOS — pregunta ANTES de buscar:
 - "sillas" → "¿Buscas sillas de comedor, sillas auxiliares (sala/decoración) o sillas de barra?"
@@ -898,7 +907,19 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
 
     case 'transferir_asesor': {
       const { razon } = args;
-      await enviarNotificacionTelegram(telefono, razon || 'Solicitud de asesor', historial, 'asesor');
+      // Adjuntar contexto del estado aunque Elena no lo haya incluido en razon
+      const estadoActual = await db.getEstado(from);
+      const ultimoProd   = estadoActual?.ultimo_producto ? (typeof estadoActual.ultimo_producto === 'string' ? JSON.parse(estadoActual.ultimo_producto) : estadoActual.ultimo_producto) : null;
+      const carritoActual = estadoActual?.carrito ? (typeof estadoActual.carrito === 'string' ? JSON.parse(estadoActual.carrito) : estadoActual.carrito) : [];
+      let razonFinal = razon || 'Solicitud de asesor';
+      if (ultimoProd?.nombre && !razonFinal.includes(ultimoProd.nombre)) {
+        razonFinal += `\nÚltimo producto visto: ${ultimoProd.nombre}`;
+      }
+      if (carritoActual.length > 0 && !razonFinal.toLowerCase().includes('carrito')) {
+        const resumenCarrito = carritoActual.map(i => `${i.producto} ×${i.cantidad || 1}`).join(', ');
+        razonFinal += `\nCarrito: ${resumenCarrito}`;
+      }
+      await enviarNotificacionTelegram(telefono, razonFinal, historial, 'asesor', { carrito: carritoActual.length ? carritoActual : undefined });
       await db.marcarTransferida(from);
       await db.limpiarConversaciones(from);
       const aviso = avisoHorarioTarde()
