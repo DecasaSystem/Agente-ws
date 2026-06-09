@@ -364,6 +364,7 @@ INSTRUCCIONES OBLIGATORIAS:
 1. SIEMPRE usa buscar_productos antes de mencionar cualquier producto o precio
 2. NUNCA inventes precios, nombres o disponibilidad — solo lo que veas en el inventario
 3. Cuando el cliente mencione un presupuesto o diga "barato/económico" → usa buscar_por_presupuesto
+4. Cuando el cliente pregunte si hay disponibilidad, si pueden conseguir algo, si está en tienda, o antes de confirmar un pedido → llama consultar_disponibilidad con el nombre exacto del producto. Si hay stock en tienda: díselo con entusiasmo ("¡Sí tenemos!"). Si solo hay en fábrica: es una ventaja, fabricación propia. Si no hay stock: ofrece fabricarlo al mismo precio (nunca digas que no se puede conseguir).
 4. Para ver carrito → llama ver_carrito
 5. Para fotos de productos → usa enviar_foto. En tu texto escribe algo como "Te envío la foto a continuación 👇" para que el cliente sepa que la imagen llega justo después (se envía como mensaje separado)
 6. Para catálogos PDF → usa enviar_catalogo y muestra la URL tal cual (sin markdown), para que WhatsApp la haga tappable
@@ -585,6 +586,23 @@ const TOOLS = [
           razon: { type: 'string', description: 'Motivo de la transferencia' }
         },
         required: ['razon']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'consultar_disponibilidad',
+      description: 'Consulta en tiempo real si hay unidades disponibles en tiendas o fábrica para un producto. Llamar cuando el cliente pregunte si hay stock, si pueden conseguir algo, si está disponible, o antes de confirmar un pedido.',
+      parameters: {
+        type: 'object',
+        properties: {
+          nombre_producto: {
+            type: 'string',
+            description: 'Nombre exacto del producto tal como aparece en el inventario (ej: "Sofá Medellín 3 puestos")'
+          }
+        },
+        required: ['nombre_producto']
       }
     }
   }
@@ -879,6 +897,25 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
       await db.limpiarConversaciones(from);
       const aviso = avisoHorarioTarde()
       return { exito: true, mensaje: 'Asesor notificado.', aviso_horario: aviso };
+    }
+
+    case 'consultar_disponibilidad': {
+      const { nombre_producto } = args;
+      const filas = await db.consultarStock(nombre_producto);
+      const tiendas = filas.filter(f => !f.es_fabrica).map(f => `${f.tienda} (${f.cantidad_disponible} und)`);
+      const fabrica = filas.find(f => f.es_fabrica);
+      if (filas.length === 0) {
+        return { disponible: false, tiendas: [], en_fabrica: false, mensaje: 'No hay unidades en exhibición ahora, pero DeCasa puede fabricarlo al mismo precio.' };
+      }
+      return {
+        disponible: true,
+        tiendas,
+        en_fabrica: !!fabrica,
+        unidades_fabrica: fabrica?.cantidad_disponible ?? 0,
+        mensaje: tiendas.length > 0
+          ? `Hay unidades disponibles en: ${tiendas.join(', ')}.`
+          : `Hay ${fabrica.cantidad_disponible} und en fábrica, disponible para entrega.`
+      };
     }
 
     default:
