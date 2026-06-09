@@ -769,6 +769,7 @@ async function getInventarioFromDB() {
       `SELECT nombre,
               precio_base AS precio,
               foto_url    AS imagen,
+              foto_url_2  AS imagen2,
               medidas, material,
               categoria   AS subcategoria
        FROM productos

@@ -81,12 +81,26 @@ async function cargarCatalogos() {
 // ─── RATE LIMITING ───────────────────────────────────────────────────────────
 
 const _rateLimitMap = new Map();
+// MessageSid dedup: evita que reintentos de Twilio procesen el mismo mensaje dos veces
+const _processedSids = new Set();
 
 function estaEnCooldown(telefono) {
   const ultima = _rateLimitMap.get(telefono) || 0;
   const ahora = Date.now();
   if (ahora - ultima < 1500) return true;
   _rateLimitMap.set(telefono, ahora);
+  return false;
+}
+
+function yaFueProcesado(sid) {
+  if (!sid) return false;
+  if (_processedSids.has(sid)) return true;
+  _processedSids.add(sid);
+  // Limpiar SIDs viejos si el set crece demasiado
+  if (_processedSids.size > 500) {
+    const iter = _processedSids.values();
+    for (let i = 0; i < 100; i++) _processedSids.delete(iter.next().value);
+  }
   return false;
 }
 
@@ -259,7 +273,7 @@ function buscarEnInventario(consulta, categoria, limite = 6) {
         resultados.push({
           nombre: prod.nombre, precio: prod.precio,
           material: prod.material || null, medidas: prod.medidas || null,
-          tieneImagen: !!prod.imagen, imagen: prod.imagen || null,
+          tieneImagen: !!prod.imagen, imagen: prod.imagen || null, imagen2: prod.imagen2 || null,
           categoria: catKey, categoriaNombre: catData.nombre, score
         });
       }
@@ -271,7 +285,7 @@ function buscarEnInventario(consulta, categoria, limite = 6) {
     return inventario[categoria].productos.slice(0, limite).map(p => ({
       nombre: p.nombre, precio: p.precio,
       material: p.material || null, medidas: p.medidas || null,
-      tieneImagen: !!p.imagen, imagen: p.imagen || null,
+      tieneImagen: !!p.imagen, imagen: p.imagen || null, imagen2: p.imagen2 || null,
       categoria, categoriaNombre: inventario[categoria].nombre, score: 0
     }));
   }
@@ -293,7 +307,7 @@ function buscarEnInventarioPorPresupuesto(presupuestoMax, categoria, limite = 5)
         resultados.push({
           nombre: prod.nombre, precio: prod.precio, precioNumerico: precio,
           material: prod.material || null, medidas: prod.medidas || null,
-          tieneImagen: !!prod.imagen, imagen: prod.imagen || null,
+          tieneImagen: !!prod.imagen, imagen: prod.imagen || null, imagen2: prod.imagen2 || null,
           categoria: catKey, categoriaNombre: catData.nombre
         });
       }
@@ -321,7 +335,7 @@ function buscarImagenProducto(nombreProducto) {
       if (score > mejorScore) { mejorScore = score; mejor = prod; }
     }
   }
-  return mejorScore > 0 ? { nombre: mejor.nombre, imagen: mejor.imagen } : null;
+  return mejorScore > 0 ? { nombre: mejor.nombre, imagen: mejor.imagen, imagen2: mejor.imagen2 || null } : null;
 }
 
 // ─── SYSTEM PROMPT ───────────────────────────────────────────────────────────
@@ -783,7 +797,7 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
       // Actualizar último producto visto (imagen incluida para visualización)
       await db.setUltimoProducto(from, { nombre: resultado.nombre, imagen: resultado.imagen || null, ts: Date.now() });
       // No devolver el URL al modelo: evita que lo escriba en el texto como markdown
-      return { exito: true, nombre: resultado.nombre, _imagenUrl: resultado.imagen, mensaje: `Foto de ${resultado.nombre} enviada al cliente.` };
+      return { exito: true, nombre: resultado.nombre, _imagenUrl: resultado.imagen, _imagen2Url: resultado.imagen2 || null, mensaje: `Foto de ${resultado.nombre} enviada al cliente.` };
     }
 
     case 'enviar_catalogo': {
@@ -913,8 +927,9 @@ async function callOpenAI(from, userMessage, historial) {
         // Coleccionar imágenes de productos (permite comparaciones con múltiples fotos)
         // Los catálogos PDF NO se envían como attachment — Google Drive no sirve como CDN
         // directo y WhatsApp falla silenciosamente. La URL va en el texto de la respuesta.
-        if (toolCall.function.name === 'enviar_foto' && resultado.exito && resultado._imagenUrl) {
-          imagenesParaEnviar.push({ url: resultado._imagenUrl, nombre: resultado.nombre });
+        if (toolCall.function.name === 'enviar_foto' && resultado.exito) {
+          if (resultado._imagenUrl) imagenesParaEnviar.push({ url: resultado._imagenUrl, nombre: resultado.nombre });
+          if (resultado._imagen2Url) imagenesParaEnviar.push({ url: resultado._imagen2Url, nombre: resultado.nombre });
         }
 
         messages.push({
@@ -959,10 +974,17 @@ app.post('/webhook', async (req, res) => {
   const toNumber = req.body.To || '';
   const mediaUrl = req.body.MediaUrl0;
   const mediaType = req.body.MediaContentType0;
+  const messageSid = req.body.MessageSid || req.body.SmsSid || '';
 
   console.log(`[MSG] ${from}: ${incomingMsg || '[media]'}`);
 
   if (!incomingMsg && !mediaUrl) return res.status(200).send('');
+
+  // Rechazar reintentos de Twilio para el mismo mensaje
+  if (yaFueProcesado(messageSid)) {
+    console.log(`[DEDUP] ${from} — SID ya procesado: ${messageSid}`);
+    return res.status(200).send('');
+  }
 
   if (estaEnCooldown(from)) {
     console.log(`[RATE] ${from} en cooldown — ignorado`);
@@ -1031,8 +1053,9 @@ app.post('/webhook', async (req, res) => {
                     for (const tc of cv.message.tool_calls) {
                       let args = {}; try { args = JSON.parse(tc.function.arguments); } catch {}
                       const toolRes = await ejecutarHerramienta(tc.function.name, args, from, historial);
-                      if (tc.function.name === 'enviar_foto' && toolRes.exito && toolRes._imagenUrl) {
-                        await twilioClient.messages.create({ from: toNumber, to: from, body: `📸 ${toolRes.nombre}`, mediaUrl: [toolRes._imagenUrl] });
+                      if (tc.function.name === 'enviar_foto' && toolRes.exito) {
+                        if (toolRes._imagenUrl) await twilioClient.messages.create({ from: toNumber, to: from, body: `📸 ${toolRes.nombre}`, mediaUrl: [toolRes._imagenUrl] });
+                        if (toolRes._imagen2Url) await twilioClient.messages.create({ from: toNumber, to: from, body: `📸 ${toolRes.nombre}`, mediaUrl: [toolRes._imagen2Url] });
                       }
                       msgs.push({ role: 'tool', tool_call_id: tc.id, content: JSON.stringify(toolRes) });
                     }
@@ -1100,8 +1123,9 @@ NUNCA digas que no puedes identificar productos. Clasifica el tipo y muestra el 
                 try { args = JSON.parse(tc.function.arguments); } catch {}
                 console.log(`[VISION-TOOL] ${tc.function.name}(${JSON.stringify(args).substring(0, 80)})`);
                 const toolRes = await ejecutarHerramienta(tc.function.name, args, from, historial);
-                if (tc.function.name === 'enviar_foto' && toolRes.exito && toolRes._imagenUrl) {
-                  imgs.push({ url: toolRes._imagenUrl, nombre: toolRes.nombre });
+                if (tc.function.name === 'enviar_foto' && toolRes.exito) {
+                  if (toolRes._imagenUrl) imgs.push({ url: toolRes._imagenUrl, nombre: toolRes.nombre });
+                  if (toolRes._imagen2Url) imgs.push({ url: toolRes._imagen2Url, nombre: toolRes.nombre });
                 }
                 msgs.push({ role: 'tool', tool_call_id: tc.id, content: JSON.stringify(toolRes) });
               }
@@ -1188,17 +1212,19 @@ NUNCA digas que no puedes identificar productos. Clasifica el tipo y muestra el 
     }
 
     // ── SALUDO PURO ────────────────────────────────────────────────
-    const msgLow = incomingMsg.toLowerCase();
-    const esSoloSaludo = /^(hola|holis|holi|holaa|holaaa|buenas?|buenos\s*(dias?|tardes?|noches?)|que\s*tal|hi\b|hello\b|hey\b|saludos|como\s*est[aá]s?)[\s!.]*$/.test(msgLow);
+    const msgLow = incomingMsg.toLowerCase().replace(/^[¡!¿?\s]+/, '');
+    const esSoloSaludo = /^(hola|holis|holi|holaa|holaaa|buenas?|buenos\s*(dias?|tardes?|noches?)|que\s*tal|hi\b|hello\b|hey\b|saludos|como\s*est[aá]s?)[\s!.¡?]*$/.test(msgLow);
 
     if (esSoloSaludo) {
-      // Reset transferido para que el usuario pueda retomar el chat con el bot
-      await db.updateEstado(from, { transferido: false });
+      // Responder de inmediato para que Twilio no reintente el webhook
       const twiml = new MessagingResponse();
       twiml.message(SALUDO_INICIAL);
-      await db.addMensaje(from, 'user', incomingMsg);
-      await db.addMensaje(from, 'assistant', SALUDO_INICIAL);
-      return res.type('text/xml').send(twiml.toString());
+      res.type('text/xml').send(twiml.toString());
+      // BD en background (no bloquea la respuesta)
+      db.updateEstado(from, { transferido: false }).catch(() => {});
+      db.addMensaje(from, 'user', incomingMsg).catch(() => {});
+      db.addMensaje(from, 'assistant', SALUDO_INICIAL).catch(() => {});
+      return;
     }
 
     // ── USUARIO TRANSFERIDO A ASESOR ───────────────────────────────
