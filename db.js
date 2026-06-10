@@ -21,11 +21,14 @@ function parseJSONField(value) {
 }
 
 const pool = mysql.createPool({
-  host: process.env.DB_HOST || 'localhost',
-  user: process.env.DB_USER || 'root',
+  host:     process.env.DB_HOST || 'localhost',
+  user:     process.env.DB_USER || process.env.DB_USERNAME || 'root',
   password: process.env.DB_PASSWORD || '',
-  database: process.env.DB_NAME || 'decasa_bot',
-  port: process.env.DB_PORT || 3306,
+  database: process.env.DB_NAME || process.env.DB_DATABASE || 'decasa_bot',
+  port:     parseInt(process.env.DB_PORT || '3306'),
+  ssl:      process.env.DB_HOST && process.env.DB_HOST !== 'localhost' && process.env.DB_HOST !== '127.0.0.1'
+              ? { rejectUnauthorized: false }
+              : undefined,
   waitForConnections: true,
   connectionLimit: 10,
   queueLimit: 0

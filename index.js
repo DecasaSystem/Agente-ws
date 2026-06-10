@@ -954,9 +954,30 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
 
 // ─── LLAMADA A OPENAI CON TOOL LOOP ──────────────────────────────────────────
 
+const RE_DISPONIBILIDAD = /\b(disponible|disponibles|tienes|tienen|hay|puedes\s+conseguir|conseguir|stock|en\s+qu[eé]\s+tienda|d[oó]nde\s+(lo|la)\s+puedo|d[oó]nde\s+(est[aá]|tienen|lo\s+tienen)|est[aá]\s+disponible|puedo\s+(verlo|verla|ir\s+a\s+ver)|tienen\s+en)\b/i
+
 async function callOpenAI(from, userMessage, historial) {
+  // Pre-fetch stock cuando la pregunta es sobre disponibilidad
+  let stockInyectado = '';
+  if (RE_DISPONIBILIDAD.test(userMessage)) {
+    try {
+      const ultimoProd = await db.getUltimoProducto(from);
+      if (ultimoProd?.nombre) {
+        const filas = await db.consultarStock(ultimoProd.nombre);
+        if (filas.length > 0) {
+          const lista = filas.map(f => `${f.tienda} (${f.cantidad_disponible} und)`).join(', ');
+          stockInyectado = `\n\n⚠️ STOCK CONFIRMADO AHORA MISMO para "${ultimoProd.nombre}": HAY UNIDADES EN → ${lista}. USA ESTE DATO en tu respuesta. No llames consultar_disponibilidad de nuevo para este producto.`;
+        } else {
+          stockInyectado = `\n\n⚠️ STOCK CONFIRMADO AHORA MISMO para "${ultimoProd.nombre}": SIN UNIDADES en tiendas físicas. Ofrece fabricarlo al mismo precio.`;
+        }
+      }
+    } catch (e) {
+      console.error('[stock-prefetch]', e.message);
+    }
+  }
+
   const messages = [
-    { role: 'system', content: SYSTEM_PROMPT },
+    { role: 'system', content: SYSTEM_PROMPT + stockInyectado },
     ...historial.map(m => ({ role: m.role, content: m.content })),
     { role: 'user', content: userMessage }
   ];
