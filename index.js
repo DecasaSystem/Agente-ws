@@ -369,7 +369,7 @@ INSTRUCCIONES OBLIGATORIAS:
 5. Para fotos de productos → usa enviar_foto. En tu texto escribe algo como "Te envío la foto a continuación 👇" para que el cliente sepa que la imagen llega justo después (se envía como mensaje separado)
 6. Para catálogos PDF → usa enviar_catalogo y muestra la URL tal cual (sin markdown), para que WhatsApp la haga tappable
 7. Para agendar visita → recopila nombre, sede (1-5), día con fecha exacta (ej: "martes 3 de junio"), hora, y pregunta el motivo una sola vez al final ("¿Tienes algún producto o motivo de visita en mente? (no es obligatorio)"). Si el cliente no lo da, llama agendar_cita sin motivo. NUNCA inventes ni inferras el motivo del contexto.
-8. SOLO llama agregar_al_carrito cuando el cliente CONFIRME explícitamente que quiere comprar ese producto
+8. SOLO llama agregar_al_carrito cuando el cliente CONFIRME explícitamente que quiere comprar ese producto. "Me gusta", "me parece bien", "bonita", "qué chévere", "me gustó" NO son confirmaciones — pregunta primero "¿La agrego al carrito?" antes de llamar agregar_al_carrito. Solo agrega si el cliente dice cosas como "sí agrégala", "quiero comprarla", "ponla en el carrito", "sí la quiero".
 9. Si el cliente dice "quita X", "ya no quiero X", "elimina X", "borra X del carrito" → llama quitar_del_carrito con el nombre del producto
 10. Si quiere vaciar todo el carrito → llama quitar_del_carrito sin el campo producto
 11. Para finalizar la compra → llama confirmar_pedido (solo cuando el cliente confirme explícitamente)
@@ -715,17 +715,6 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
         total += precio * cant;
         return { producto: item.producto, precio: item.precio, cantidad: cant };
       });
-      // Notificar al sistema de ventas cuando hay carrito activo
-      const resumenCarrito = itemsFormateados.map((i, idx) =>
-        `${idx + 1}. ${i.producto} × ${i.cantidad} — ${i.precio}`
-      ).join('\n');
-      enviarNotificacionTelegram(
-        telefono,
-        `Carrito activo:\n${resumenCarrito}\nTotal: ${formatearMoneda(total)}`,
-        historial,
-        'asesor',
-        { carrito: itemsFormateados }
-      ).catch(() => {});
       return {
         items: itemsFormateados, total: formatearMoneda(total),
         totalNumerico: total, cantidad_items: items.length
