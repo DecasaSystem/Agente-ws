@@ -340,7 +340,7 @@ function buscarImagenProducto(nombreProducto) {
 
 // ─── SYSTEM PROMPT ───────────────────────────────────────────────────────────
 
-const SYSTEM_PROMPT = `Eres Elena, asesora de ventas experta y amable de DeCasa, tienda especializada en muebles de madera Flor Morado de alta calidad.
+const _SYSTEM_PROMPT_BASE = `Eres Elena, asesora de ventas experta y amable de DeCasa, tienda especializada en muebles de madera Flor Morado de alta calidad.
 
 IDENTIDAD:
 - Nombre: Elena | Empresa: DeCasa
@@ -428,7 +428,7 @@ REGLAS DE VENTA:
 
 FLUJO DE AGENDAMIENTO:
 Pide en orden: nombre completo → sede → fecha exacta → hora. El motivo es OPCIONAL: solo inclúyelo si el cliente lo menciona, NUNCA lo inventes ni lo inferas del contexto.
-Para la fecha pide el DÍA DE LA SEMANA y la FECHA (ej: "martes 3 de junio", "viernes 20 de junio"). No aceptes solo el nombre del día sin número de fecha.
+Para la fecha pide el DÍA DE LA SEMANA, el NÚMERO DE DÍA, el MES y el AÑO (ej: "martes 3 de junio de 2026", "viernes 20 de julio de 2026"). No aceptes una fecha sin año ni solo el nombre del día. Si el cliente da una fecha ambigua ("el miércoles", "el 1 de noviembre"), usa FECHA ACTUAL para calcular la fecha correcta y CONFIRMA antes de agendar: "¿Confirmamos para el [día de semana] [número] de [mes] de [año]?". NUNCA llames agendar_cita con una fecha que no hayáis confirmado explícitamente.
 El motivo es OPCIONAL: pregúntalo una sola vez ("¿Tienes algún producto o motivo de visita? (no es obligatorio)") — si no quiere darlo, llama agendar_cita igual. NUNCA inventes ni inferras el motivo del contexto.
 Al pedir la sede, SIEMPRE muestra la lista completa:
   1. Avenida Bolívar # 16 N 26, Armenia
@@ -447,6 +447,14 @@ Eres una vendedora cálida, entusiasta y persuasiva — como una amiga experta e
 - Destaca beneficios según el contexto: "perfecta si tienes niños o mascotas", "la madera Flor Morado no se astilla ni decolora"
 - Si el precio asusta, llama buscar_por_presupuesto antes de rendirte
 - Responde SIEMPRE en español. Máximo 150 palabras.`;
+
+function buildSystemPrompt() {
+  const ahora = new Date()
+  const diasSemana = ['domingo','lunes','martes','miércoles','jueves','viernes','sábado']
+  const meses = ['enero','febrero','marzo','abril','mayo','junio','julio','agosto','septiembre','octubre','noviembre','diciembre']
+  const fechaHoy = `${diasSemana[ahora.getDay()]} ${ahora.getDate()} de ${meses[ahora.getMonth()]} de ${ahora.getFullYear()}`
+  return `FECHA ACTUAL: Hoy es ${fechaHoy}. Usa esta fecha para resolver referencias relativas como "el miércoles", "esta semana", "el próximo viernes".\n\n` + _SYSTEM_PROMPT_BASE
+}
 
 // ─── TOOL DEFINITIONS ────────────────────────────────────────────────────────
 
@@ -588,7 +596,7 @@ const TOOLS = [
         properties: {
           nombre: { type: 'string', description: 'Nombre completo del cliente (solo el nombre, sin frases introductorias)' },
           ubicacion: { type: 'number', description: 'Número de sede (1-5)' },
-          dia: { type: 'string', description: 'Fecha de la visita con día de la semana y número de día y mes (ej: "martes 3 de junio", "viernes 20 de julio"). Siempre incluye el número del día y el mes.' },
+          dia: { type: 'string', description: 'Fecha de la visita con día de la semana, número de día, mes y año (ej: "martes 3 de junio de 2026", "viernes 20 de julio de 2026"). SIEMPRE incluye el año. NUNCA inventes ni asumas el año — confírmalo con el cliente si es ambiguo.' },
           hora: { type: 'string', description: 'Hora en formato HH:MM (ej: "14:00", "09:30")' },
           motivo: { type: 'string', description: 'Motivo de la visita (opcional, solo si el cliente lo menciona)' }
         },
@@ -913,7 +921,7 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
 
 async function callOpenAI(from, userMessage, historial) {
   const messages = [
-    { role: 'system', content: SYSTEM_PROMPT },
+    { role: 'system', content: buildSystemPrompt() },
     ...historial.map(m => ({ role: m.role, content: m.content })),
     { role: 'user', content: userMessage }
   ];
@@ -1061,7 +1069,7 @@ app.post('/webhook', async (req, res) => {
                 const mime = (mediaType || 'image/jpeg').split(';')[0];
                 const historial = await db.getHistorial(from, 6);
                 const msgs = [
-                  { role: 'system', content: SYSTEM_PROMPT },
+                  { role: 'system', content: buildSystemPrompt() },
                   ...historial.map(m => ({ role: m.role, content: m.content })),
                   { role: 'user', content: [
                     { type: 'image_url', image_url: { url: `data:${mime};base64,${base64}`, detail: 'low' } },
@@ -1103,7 +1111,7 @@ app.post('/webhook', async (req, res) => {
           const historial = await db.getHistorial(from, 6);
 
           // Instrucción extra para vision: evita el rechazo de "no puedo identificar"
-          const systemVision = SYSTEM_PROMPT + `
+          const systemVision = buildSystemPrompt() + `
 
 INSTRUCCIÓN PARA IMÁGENES: Cuando el cliente envía una foto de un mueble:
 1. Identifica el TIPO de mueble (silla de comedor, sofá, cama, mesa, etc.) y la CATEGORÍA del catálogo.
