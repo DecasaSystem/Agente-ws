@@ -1277,8 +1277,26 @@ NUNCA digas que no puedes identificar productos. Clasifica el tipo y muestra el 
       return;
     }
 
-    // ── SALUDO PURO ────────────────────────────────────────────────
     const msgLow = incomingMsg.toLowerCase().replace(/^[¡!¿?\s]+/, '');
+
+    // ── USUARIO TRANSFERIDO A ASESOR ───────────────────────────────
+    // Mientras siga transferido, la IA NO interviene bajo ninguna circunstancia
+    // (ni con un saludo, ni por palabras clave de producto) — un asesor humano
+    // puede estar hablando activamente con el cliente. El reseteo a "no
+    // transferido" ocurre solo por inactividad (verificarYLimpiarInactividad,
+    // 45 min sin mensajes), así que si el cliente vuelve a escribir más tarde
+    // (otro día, por ejemplo) el estado ya se limpió solo y la IA lo atiende
+    // normalmente de nuevo.
+    if (await db.estaTransferida(from)) {
+      const twiml = new MessagingResponse();
+      twiml.message('✅ Tu mensaje fue recibido. El asesor te responderá pronto. 😊');
+      res.type('text/xml').send(twiml.toString());
+      const historialTelegram = await db.getHistorial(from, 6);
+      enviarNotificacionTelegram(from.replace('whatsapp:', ''), incomingMsg, historialTelegram).catch(() => {});
+      return;
+    }
+
+    // ── SALUDO PURO ────────────────────────────────────────────────
     const esSoloSaludo = /^(hola|holis|holi|holaa|holaaa|buenas?|buenos\s*(dias?|tardes?|noches?)|que\s*tal|hi\b|hello\b|hey\b|saludos|como\s*est[aá]s?)[\s!.¡?]*$/.test(msgLow);
 
     if (esSoloSaludo) {
@@ -1287,26 +1305,9 @@ NUNCA digas que no puedes identificar productos. Clasifica el tipo y muestra el 
       twiml.message(SALUDO_INICIAL);
       res.type('text/xml').send(twiml.toString());
       // BD en background (no bloquea la respuesta)
-      db.updateEstado(from, { transferido: false }).catch(() => {});
       db.addMensaje(from, 'user', incomingMsg).catch(() => {});
       db.addMensaje(from, 'assistant', SALUDO_INICIAL).catch(() => {});
       return;
-    }
-
-    // ── USUARIO TRANSFERIDO A ASESOR ───────────────────────────────
-    if (await db.estaTransferida(from)) {
-      // Si el mensaje es claramente para el bot (citas, productos, bot) → resetear y dejar pasar al AI
-      const esParaBot = /\b(agendar|cita|visita|producto|mueble|precio|cat[aá]logo|ver|mostrar|buscar|quiero|necesito|tengo|tendr[íi]a|carrito|comprar|sofá|sofa|silla|mesa|cama|colch[oó]n|armario|agente|bot|elena)\b/i.test(msgLow);
-      if (esParaBot) {
-        await db.updateEstado(from, { transferido: false });
-      } else {
-        const twiml = new MessagingResponse();
-        twiml.message('✅ Tu mensaje fue recibido. El asesor te responderá pronto. 😊');
-        res.type('text/xml').send(twiml.toString());
-        const historialTelegram = await db.getHistorial(from, 6);
-        enviarNotificacionTelegram(from.replace('whatsapp:', ''), incomingMsg, historialTelegram).catch(() => {});
-        return;
-      }
     }
 
     // ── LLAMADA A OPENAI CON TIMEOUT ───────────────────────────────
