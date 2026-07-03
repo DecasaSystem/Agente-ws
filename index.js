@@ -83,6 +83,8 @@ async function cargarCatalogos() {
 const _rateLimitMap = new Map();
 // MessageSid dedup: evita que reintentos de Twilio procesen el mismo mensaje dos veces
 const _processedSids = new Set();
+// Cuenta imágenes/capturas seguidas que la IA no logró identificar, por cliente (se resetea al reiniciar el servidor)
+const _capturasNoIdentificadas = new Map();
 
 function estaEnCooldown(telefono) {
   const ultima = _rateLimitMap.get(telefono) || 0;
@@ -595,6 +597,14 @@ const TOOLS = [
   {
     type: 'function',
     function: {
+      name: 'reportar_imagen_no_identificada',
+      description: 'Llama esta función SIEMPRE que analices una imagen (foto o captura de pantalla) y NO puedas identificar con confianza qué producto es, incluso después de intentar leer el texto visible y clasificar el tipo de mueble. Es solo para seguimiento interno, no se le muestra al cliente tal cual.',
+      parameters: { type: 'object', properties: {} }
+    }
+  },
+  {
+    type: 'function',
+    function: {
       name: 'agendar_cita',
       description: 'Guarda una cita de visita a tienda. Recopila TODA la info primero y luego llama esta función. El nombre debe ser solo el nombre (sin "me llamo" ni "mi nombre es").',
       parameters: {
@@ -897,6 +907,22 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
       };
     }
 
+    case 'reportar_imagen_no_identificada': {
+      const intentos = (_capturasNoIdentificadas.get(telefono) ?? 0) + 1;
+      _capturasNoIdentificadas.set(telefono, intentos);
+      if (intentos >= 2) {
+        _capturasNoIdentificadas.set(telefono, 0);
+        enviarNotificacionTelegram(
+          telefono,
+          `El cliente ha enviado ${intentos} imágenes/capturas seguidas que la IA no pudo identificar en el inventario. Revisar la conversación y ayudarle manualmente a encontrar el producto.`,
+          historial,
+          'asesor'
+        ).catch(e => console.error('[REDES] no se pudo notificar imagen no identificada:', e.message));
+        return { ok: true, escalado: true, mensaje: 'Se avisó a un asesor porque ya van varios intentos sin identificar la imagen. Coméntale al cliente que un asesor también le va a ayudar con esto, sin dejar de mostrarle opciones parecidas.' };
+      }
+      return { ok: true, escalado: false, mensaje: 'Registrado. Sigue el flujo normal: pregunta si el cliente puede leer el nombre y muéstrale opciones parecidas según el tipo de mueble que identifiques.' };
+    }
+
     case 'transferir_asesor': {
       const { razon } = args;
       // Adjuntar contexto del estado aunque Elena no lo haya incluido en razon
@@ -997,6 +1023,8 @@ const SALUDO_INICIAL = `¡Hola! 👋 Soy Elena, tu asesora de DeCasa.
 
 📦 Categorías: Sillas, Bases de Comedor, Camas, Mesas, Sofás, Colchones
 🕐 Horario: L-V 8am-5pm | Sábado 8am-12pm
+
+📸 ¿Nos compartes una foto o captura de lo que buscas? Si alcanzas a ver el nombre del producto, cuéntanoslo también así te ayudamos más rápido
 
 💬 ¿Qué mueble estás buscando hoy? 😊`;
 
@@ -1120,7 +1148,7 @@ app.post('/webhook', async (req, res) => {
           const systemVision = buildSystemPrompt() + `
 
 INSTRUCCIÓN PARA IMÁGENES: Cuando el cliente envía una foto:
-0. Si es una CAPTURA DE PANTALLA de una publicación de red social (se ve interfaz de la app, texto de descripción, nombre de usuario, etc. — muy común en clientes mayores que no saben usar "compartir" y en su lugar mandan un screenshot): primero intenta LEER cualquier texto visible que pueda ser el nombre del producto. Si logras leer un nombre y aparece en el inventario, llama buscar_productos con ese nombre exacto y preséntalo directamente. Si NO logras leer un nombre, o no aparece en el inventario, dile al cliente algo como "No alcancé a ver el nombre del producto en la imagen 🙏 ¿me dices si tú lo alcanzas a leer, o qué tipo de mueble es? Mientras tanto te muestro opciones parecidas:" y continúa con el paso 1 usando el tipo de mueble que identifiques visualmente.
+0. Si es una CAPTURA DE PANTALLA de una publicación de red social (se ve interfaz de la app, texto de descripción, nombre de usuario, etc. — muy común en clientes mayores que no saben usar "compartir" y en su lugar mandan un screenshot): primero intenta LEER cualquier texto visible que pueda ser el nombre del producto. Si logras leer un nombre y aparece en el inventario, llama buscar_productos con ese nombre exacto y preséntalo directamente. Si NO logras leer un nombre, o no aparece en el inventario: llama reportar_imagen_no_identificada, dile al cliente algo como "No alcancé a ver el nombre del producto en la imagen 🙏 ¿me dices si tú lo alcanzas a leer, o qué tipo de mueble es? Mientras tanto te muestro opciones parecidas:" y continúa con el paso 1 usando el tipo de mueble que identifiques visualmente.
 1. Identifica el TIPO de mueble (silla de comedor, sofá, cama, mesa, etc.) y la CATEGORÍA del catálogo.
 2. Llama buscar_productos DOS VECES:
    a) Primera con la categoría exacta y limite:10 para obtener TODOS los productos de esa línea.
