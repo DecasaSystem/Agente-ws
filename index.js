@@ -1119,7 +1119,8 @@ app.post('/webhook', async (req, res) => {
           // Instrucción extra para vision: evita el rechazo de "no puedo identificar"
           const systemVision = buildSystemPrompt() + `
 
-INSTRUCCIÓN PARA IMÁGENES: Cuando el cliente envía una foto de un mueble:
+INSTRUCCIÓN PARA IMÁGENES: Cuando el cliente envía una foto:
+0. Si es una CAPTURA DE PANTALLA de una publicación de red social (se ve interfaz de la app, texto de descripción, nombre de usuario, etc. — muy común en clientes mayores que no saben usar "compartir" y en su lugar mandan un screenshot): primero intenta LEER cualquier texto visible que pueda ser el nombre del producto. Si logras leer un nombre y aparece en el inventario, llama buscar_productos con ese nombre exacto y preséntalo directamente. Si NO logras leer un nombre, o no aparece en el inventario, dile al cliente algo como "No alcancé a ver el nombre del producto en la imagen 🙏 ¿me dices si tú lo alcanzas a leer, o qué tipo de mueble es? Mientras tanto te muestro opciones parecidas:" y continúa con el paso 1 usando el tipo de mueble que identifiques visualmente.
 1. Identifica el TIPO de mueble (silla de comedor, sofá, cama, mesa, etc.) y la CATEGORÍA del catálogo.
 2. Llama buscar_productos DOS VECES:
    a) Primera con la categoría exacta y limite:10 para obtener TODOS los productos de esa línea.
