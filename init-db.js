@@ -174,6 +174,20 @@ async function initDB() {
       console.log('✅ Columna presupuesto añadida');
     }
 
+    // Cache de perceptual hash (dHash) de las fotos de productos, para poder
+    // identificar por comparación de imagen cuando un cliente reenvía/captura una
+    // foto que ya está en nuestro propio catálogo. No pertenece a Laravel: es solo
+    // un índice derivado que este agente reconstruye por su cuenta.
+    await connection.query(`
+      CREATE TABLE IF NOT EXISTS producto_imagen_hash (
+        producto_nombre VARCHAR(150) PRIMARY KEY,
+        imagen_url      VARCHAR(500) NOT NULL,
+        hash            CHAR(16) NOT NULL,
+        updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+      )
+    `);
+    console.log('✅ Tabla producto_imagen_hash creada o verificada');
+
     console.log('\n🎉 Base de datos lista!\n');
     
   } catch (error) {

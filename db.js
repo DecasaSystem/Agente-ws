@@ -671,11 +671,32 @@ async function limpiarConversacionesInactivas(timeoutMinutos = TIMEOUT_INACTIVID
 }
 
 // ─────────────────────────────────────────────
+// HASH DE IMÁGENES DE PRODUCTOS
+// ─────────────────────────────────────────────
+
+async function getHashesProductos() {
+  const [rows] = await pool.query(
+    'SELECT producto_nombre, imagen_url, hash FROM producto_imagen_hash'
+  );
+  return rows;
+}
+
+async function upsertHashProducto(nombre, imagenUrl, hash) {
+  await pool.query(
+    `INSERT INTO producto_imagen_hash (producto_nombre, imagen_url, hash) VALUES (?, ?, ?)
+     ON DUPLICATE KEY UPDATE imagen_url = VALUES(imagen_url), hash = VALUES(hash)`,
+    [nombre, imagenUrl, hash]
+  );
+}
+
+// ─────────────────────────────────────────────
 // EXPORTS
 // ─────────────────────────────────────────────
 
 module.exports = {
   pool,
+  getHashesProductos,
+  upsertHashProducto,
   getOrCreateUsuario,
   getHistorial,
   addMensaje,

@@ -35,6 +35,7 @@ const { processRoomImage } = require('./image-processor');
 const knowledge = require('./knowledge.json');
 const utils = require('./utils');
 const { fetchWithRetry } = require('./httpClient');
+const imgHash = require('./image-hash');
 
 // ─── OPENAI ──────────────────────────────────────────────────────────────────
 
@@ -57,6 +58,67 @@ async function cargarInventario() {
     }
   } catch (err) {
     console.error('[INVENTARIO] ❌ Error:', err.message);
+  }
+}
+
+// ─── HASH DE IMÁGENES DE CATÁLOGO (identificar fotos reenviadas/capturadas) ───
+
+let hashesCatalogo = new Map(); // nombre -> { hash, imagen }
+
+function productosPlanos() {
+  const plano = [];
+  for (const cat of Object.values(inventario)) {
+    for (const p of cat.productos || []) {
+      if (p.imagen) plano.push({ nombre: p.nombre, imagen: p.imagen });
+    }
+  }
+  return plano;
+}
+
+async function sincronizarHashesCatalogo() {
+  try {
+    const existentes = await db.getHashesProductos();
+    hashesCatalogo = new Map(existentes.map(r => [r.producto_nombre, { hash: r.hash, imagen: r.imagen_url }]));
+
+    // Solo se procesan productos nuevos o cuya foto cambió — evita redescargar todo
+    // el catálogo en cada refresco de inventario (cada 30 min). Además se limita
+    // cuántos se procesan por ciclo: con un catálogo grande (cientos de fotos) no
+    // conviene bajarlas todas de un tirón en un servidor con poca RAM — el resto
+    // se completa en los siguientes ciclos.
+    const LOTE_MAX = 60;
+    const todosPendientes = productosPlanos().filter(p => hashesCatalogo.get(p.nombre)?.imagen !== p.imagen);
+    const pendientes = todosPendientes.slice(0, LOTE_MAX);
+    for (const p of pendientes) {
+      try {
+        const hash = await imgHash.hashDesdeUrl(p.imagen);
+        await db.upsertHashProducto(p.nombre, p.imagen, hash);
+        hashesCatalogo.set(p.nombre, { hash, imagen: p.imagen });
+      } catch (e) {
+        console.warn(`[hash-imagen] no se pudo procesar "${p.nombre}":`, e.message);
+      }
+      await new Promise(r => setTimeout(r, 150));
+    }
+    if (pendientes.length) {
+      console.log(`[hash-imagen] ${pendientes.length} fotos de catálogo indexadas${todosPendientes.length > LOTE_MAX ? ` (${todosPendientes.length - LOTE_MAX} quedan para el próximo ciclo)` : ''}`);
+    }
+  } catch (e) {
+    console.error('[hash-imagen] Error sincronizando:', e.message);
+  }
+}
+
+// Compara una imagen entrante contra el catálogo indexado y devuelve el nombre
+// del producto si hay coincidencia confiable (misma foto, reescalada/recomprimida/
+// recortada en un screenshot), o null si no hay match.
+async function identificarProductoPorImagen(buffer) {
+  if (!hashesCatalogo.size) return null;
+  try {
+    const hashesEntrada = await imgHash.hashesCandidatos(buffer);
+    const catalogoArr = [...hashesCatalogo.entries()].map(([nombre, v]) => [nombre, v.hash]);
+    const match = imgHash.mejorCoincidencia(hashesEntrada, catalogoArr);
+    return match?.nombre ?? null;
+  } catch (e) {
+    console.warn('[hash-imagen] no se pudo comparar imagen entrante:', e.message);
+    return null;
   }
 }
 
@@ -636,11 +698,27 @@ const TOOLS = [
   },
 ];
 
-function avisoHorarioTarde() {
-  const h = parseInt(new Date().toLocaleString('en-US', { timeZone: 'America/Bogota', hour: 'numeric', hour12: false }))
-  return (h >= 21 || h < 8)
-    ? 'Ya es tarde (después de las 9pm). Avisa al cliente que el asesor puede que le responda mañana, pero que harán su mejor esfuerzo. Agradece su paciencia.'
-    : null
+// Horario real de atención: Lun-Vie 8am-5pm, Sáb 8am-12pm, domingo cerrado.
+// (La versión anterior solo miraba la hora 21-8 e ignoraba el día de la semana,
+// así que un mensaje sábado en la tarde o cualquier hora del domingo no avisaba
+// nada aunque el asesor solo fuera a responder hasta el siguiente día hábil.)
+function avisoFueraHorario() {
+  const partes = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/Bogota', weekday: 'short', hour: 'numeric', hour12: false,
+  }).formatToParts(new Date())
+  const dia  = partes.find(p => p.type === 'weekday')?.value
+  let hora   = parseInt(partes.find(p => p.type === 'hour')?.value)
+  if (hora === 24) hora = 0
+
+  const dentroHorario = dia === 'Sun'
+    ? false
+    : dia === 'Sat'
+      ? hora >= 8 && hora < 12
+      : hora >= 8 && hora < 17
+
+  return dentroHorario
+    ? null
+    : 'Estamos fuera de nuestro horario de atención (Lun-Vie 8am-5pm, Sáb 8am-12pm). Avisa al cliente que el asesor puede que le responda hasta el próximo horario hábil, pero que harán su mejor esfuerzo. Agradece su paciencia.'
 }
 
 // ─── EJECUTAR HERRAMIENTAS ────────────────────────────────────────────────────
@@ -940,7 +1018,7 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
       await enviarNotificacionTelegram(telefono, razonFinal, historial, 'asesor', { carrito: carritoActual.length ? carritoActual : undefined });
       await db.marcarTransferida(from);
       await db.limpiarConversaciones(from);
-      const aviso = avisoHorarioTarde()
+      const aviso = avisoFueraHorario()
       return { exito: true, mensaje: 'Asesor notificado.', aviso_horario: aviso };
     }
 
@@ -1102,12 +1180,17 @@ app.post('/webhook', async (req, res) => {
                 const base64 = imageBuffer.toString('base64');
                 const mime = (mediaType || 'image/jpeg').split(';')[0];
                 const historial = await db.getHistorial(from, 6);
+                const nombreDetectado = await identificarProductoPorImagen(imageBuffer);
+                const textoBase = (incomingMsg || 'El cliente quiere ver opciones de muebles similares.') + '\n\nIdentifica el tipo de mueble y muestra opciones del catálogo con fotos.';
+                const textoConMatch = nombreDetectado
+                  ? `[La imagen coincide con este producto de nuestro catálogo (misma foto o muy similar): "${nombreDetectado}". Trátalo como identificado con certeza.]\n${textoBase}`
+                  : textoBase;
                 const msgs = [
                   { role: 'system', content: buildSystemPrompt() },
                   ...historial.map(m => ({ role: m.role, content: m.content })),
                   { role: 'user', content: [
-                    { type: 'image_url', image_url: { url: `data:${mime};base64,${base64}`, detail: 'low' } },
-                    { type: 'text', text: (incomingMsg || 'El cliente quiere ver opciones de muebles similares.') + '\n\nIdentifica el tipo de mueble y muestra opciones del catálogo con fotos.' }
+                    { type: 'image_url', image_url: { url: `data:${mime};base64,${base64}`, detail: 'high' } },
+                    { type: 'text', text: textoConMatch }
                   ]}
                 ];
                 for (let r = 0; r < 5; r++) {
@@ -1140,7 +1223,10 @@ app.post('/webhook', async (req, res) => {
           const imageBuffer = await downloadFromTwilio(mediaUrl);
           const base64 = imageBuffer.toString('base64');
           const mime = (mediaType || 'image/jpeg').split(';')[0];
-          const contextoUsuario = incomingMsg || 'El cliente envió una foto de un mueble.';
+          const nombreDetectado = await identificarProductoPorImagen(imageBuffer);
+          const contextoUsuario = nombreDetectado
+            ? `[La imagen coincide con este producto de nuestro catálogo (misma foto o muy similar): "${nombreDetectado}". Trátalo como identificado con certeza, sin pedirle al cliente que lea nada.]\n${incomingMsg || 'El cliente envió una foto de un mueble.'}`
+            : (incomingMsg || 'El cliente envió una foto de un mueble.');
 
           const historial = await db.getHistorial(from, 6);
 
@@ -1148,7 +1234,8 @@ app.post('/webhook', async (req, res) => {
           const systemVision = buildSystemPrompt() + `
 
 INSTRUCCIÓN PARA IMÁGENES: Cuando el cliente envía una foto:
-0. Si es una CAPTURA DE PANTALLA de una publicación de red social (se ve interfaz de la app, texto de descripción, nombre de usuario, etc. — muy común en clientes mayores que no saben usar "compartir" y en su lugar mandan un screenshot): primero intenta LEER cualquier texto visible que pueda ser el nombre del producto. Si logras leer un nombre y aparece en el inventario, llama buscar_productos con ese nombre exacto y preséntalo directamente. Si NO logras leer un nombre, o no aparece en el inventario: llama reportar_imagen_no_identificada, dile al cliente algo como "No alcancé a ver el nombre del producto en la imagen 🙏 ¿me dices si tú lo alcanzas a leer, o qué tipo de mueble es? Mientras tanto te muestro opciones parecidas:" y continúa con el paso 1 usando el tipo de mueble que identifiques visualmente.
+0. Si es una CAPTURA DE PANTALLA de una publicación de red social (se ve interfaz de la app, texto de descripción, nombre de usuario, etc. — muy común en clientes mayores que no saben usar "compartir" y en su lugar mandan un screenshot): primero intenta LEER cualquier texto visible que pueda ser el nombre del producto. Si logras leer un nombre y aparece en el inventario, llama buscar_productos con ese nombre exacto y preséntalo directamente. Si la captura se ve claramente recortada arriba (el encabezado o la descripción quedan tapados por la barra de estado del celular) dile al cliente que en vez de una captura comparta la publicación o foto directamente — así se puede leer el nombre completo. Si NO logras leer un nombre, o no aparece en el inventario: llama reportar_imagen_no_identificada, dile al cliente algo como "No alcancé a ver el nombre del producto en la imagen 🙏 ¿me dices si tú lo alcanzas a leer, o qué tipo de mueble es? Mientras tanto te muestro opciones parecidas:" y continúa con el paso 1 usando el tipo de mueble que identifiques visualmente.
+0b. Si el mensaje del sistema ya dice "La imagen coincide con este producto de nuestro catálogo": es una coincidencia automática por comparación de foto, no una adivinanza — llama buscar_productos con ese nombre exacto y preséntalo directamente, saltando el paso 0.
 1. Identifica el TIPO de mueble (silla de comedor, sofá, cama, mesa, etc.) y la CATEGORÍA del catálogo.
 2. Llama buscar_productos DOS VECES:
    a) Primera con la categoría exacta y limite:10 para obtener TODOS los productos de esa línea.
@@ -1165,7 +1252,7 @@ NUNCA digas que no puedes identificar productos. Clasifica el tipo y muestra el 
             {
               role: 'user',
               content: [
-                { type: 'image_url', image_url: { url: `data:${mime};base64,${base64}`, detail: 'low' } },
+                { type: 'image_url', image_url: { url: `data:${mime};base64,${base64}`, detail: 'high' } },
                 { type: 'text', text: contextoUsuario + '\n\nDescribe las características visuales del mueble en la foto y busca opciones similares en nuestro catálogo con sus precios.' }
               ]
             }
@@ -1367,6 +1454,7 @@ app.get('/webhook', (req, res) => {
 app.post('/refresh-inventario', async (req, res) => {
   await cargarInventario();
   await cargarCatalogos();
+  sincronizarHashesCatalogo().catch(e => console.error('[hash-imagen] error:', e.message));
   res.json({ status: 'ok', categorias: Object.keys(inventario).length, catalogos: Object.keys(catalogosDB).length });
 });
 
@@ -1430,9 +1518,15 @@ async function startServer() {
     console.error('[SERVER] ❌ Error BD:', err.message);
   }
 
-  await cargarInventario();
+  const refrescarInventarioYHashes = async () => {
+    await cargarInventario();
+    await sincronizarHashesCatalogo();
+  };
+  await refrescarInventarioYHashes();
   await cargarCatalogos();
-  setInterval(cargarInventario, 30 * 60 * 1000);
+  setInterval(() => {
+    refrescarInventarioYHashes().catch(e => console.error('[INVENTARIO] error refrescando:', e.message));
+  }, 30 * 60 * 1000);
   setInterval(cargarCatalogos, 60 * 60 * 1000); // Catálogos cada hora
 
   const server = app.listen(PORT, () => {
