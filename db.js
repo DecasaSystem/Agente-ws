@@ -7,6 +7,14 @@ const mysql = require('mysql2/promise');
 
 const TIMEOUT_INACTIVIDAD_MINUTOS = 45; // Aumentado de 10 a 45 min
 
+// Red de seguridad para conversaciones "tomadas" por un asesor (ver RedesController
+// en decasa-api, que ahora activa/libera transferido con los botones Tomar/Terminar):
+// si el asesor se olvida de dar "Terminar", el cliente no debe quedar mudo para
+// siempre. Pero tampoco puede ser el mismo timeout corto de limpieza general (45 min),
+// porque el asesor puede tardar en responder sin que eso signifique que abandonó el
+// caso. Se usa solo cuando transferido = true.
+const TIMEOUT_TRANSFERIDO_MINUTOS = 360; // 6 horas
+
 function parseJSONField(value) {
   if (!value) return null;
   if (typeof value === 'object') return value;
@@ -609,19 +617,28 @@ async function resetearEstadoSinPedido(telefono) {
 async function verificarYLimpiarInactividad(telefono, timeoutMinutos = TIMEOUT_INACTIVIDAD_MINUTOS) {
   const telefonoLimpio = telefono.replace('whatsapp:', '');
 
+  // El diff se calcula DENTRO de MySQL (TIMESTAMPDIFF), no restando un `new Date()` de
+  // Node contra una fecha ya parseada del driver: el servidor de Node corre en horario
+  // de Bogotá y la sesión de MySQL en Aiven es UTC, así que comparar objetos Date de
+  // ambos lados quedaba desfasado ~5 horas (el timeout "de 45 min" terminaba disparando
+  // como a las 5h45).
   const [usuarios] = await pool.query(
-    'SELECT id, last_interaction FROM clientes_wa WHERE telefono = ?',
+    'SELECT id, TIMESTAMPDIFF(MINUTE, last_interaction, NOW()) AS diff_minutos FROM clientes_wa WHERE telefono = ?',
     [telefonoLimpio]
   );
 
   if (usuarios.length === 0) return;
 
-  const usuario = usuarios[0];
-  const ultimaInteraccion = new Date(usuario.last_interaction);
-  const ahora = new Date();
-  const diffMinutos = (ahora - ultimaInteraccion) / (1000 * 60);
+  const diffMinutos = usuarios[0].diff_minutos;
 
-  if (diffMinutos >= timeoutMinutos) {
+  // Mientras un asesor tiene la conversación tomada (transferido = true), no la demos
+  // por abandonada con el timeout corto normal — el asesor puede tardar en responder
+  // sin haber abandonado el caso. Solo se libera si pasa el timeout largo (red de
+  // seguridad por si olvidó dar "Terminar" en el panel de Redes).
+  const estado = await getEstado(telefono);
+  const timeoutEfectivo = estado?.transferido ? TIMEOUT_TRANSFERIDO_MINUTOS : timeoutMinutos;
+
+  if (diffMinutos >= timeoutEfectivo) {
     const tienePedidoConfirmado = await tienePedido(telefono);
 
     if (!tienePedidoConfirmado) {
