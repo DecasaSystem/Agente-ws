@@ -156,6 +156,18 @@ function estaEnCooldown(telefono) {
   return false;
 }
 
+// Evita repetir el aviso "tu mensaje fue recibido" (y la notificación al sistema de
+// ventas) en cada mensaje que el cliente mande mientras espera al asesor — como mucho
+// una vez cada 2 minutos por cliente.
+const _avisosEsperaEnviados = new Map();
+function debeEnviarAvisoEspera(telefono) {
+  const ultima = _avisosEsperaEnviados.get(telefono) || 0;
+  const ahora = Date.now();
+  if (ahora - ultima < 2 * 60 * 1000) return false;
+  _avisosEsperaEnviados.set(telefono, ahora);
+  return true;
+}
+
 function yaFueProcesado(sid) {
   if (!sid) return false;
   if (_processedSids.has(sid)) return true;
@@ -1369,17 +1381,20 @@ NUNCA digas que no puedes identificar productos. Clasifica el tipo y muestra el 
     // ── USUARIO TRANSFERIDO A ASESOR ───────────────────────────────
     // Mientras siga transferido, la IA NO interviene bajo ninguna circunstancia
     // (ni con un saludo, ni por palabras clave de producto) — un asesor humano
-    // puede estar hablando activamente con el cliente. El reseteo a "no
-    // transferido" ocurre solo por inactividad (verificarYLimpiarInactividad,
-    // 45 min sin mensajes), así que si el cliente vuelve a escribir más tarde
-    // (otro día, por ejemplo) el estado ya se limpió solo y la IA lo atiende
-    // normalmente de nuevo.
+    // puede estar hablando activamente con el cliente. Se libera cuando el asesor
+    // da "Terminar" en el panel de Redes, o como red de seguridad tras varias horas
+    // de inactividad (ver TIMEOUT_TRANSFERIDO_MINUTOS en db.js) si lo olvidó.
+    //
+    // Importante: NO se vuelve a notificar al sistema de ventas en cada mensaje del
+    // cliente mientras espera — eso creaba una tarjeta "pendiente" nueva por cada
+    // mensaje, como si fuera otra solicitud sin reclamar, aunque el cliente ya
+    // estuviera siendo atendido. La solicitud original ya tiene el historial.
     if (await db.estaTransferida(from)) {
       const twiml = new MessagingResponse();
-      twiml.message('✅ Tu mensaje fue recibido. El asesor te responderá pronto. 😊');
+      if (debeEnviarAvisoEspera(from)) {
+        twiml.message('✅ Tu mensaje fue recibido. El asesor te responderá pronto. 😊');
+      }
       res.type('text/xml').send(twiml.toString());
-      const historialTelegram = await db.getHistorial(from, 6);
-      enviarNotificacionTelegram(from.replace('whatsapp:', ''), incomingMsg, historialTelegram).catch(() => {});
       return;
     }
 
