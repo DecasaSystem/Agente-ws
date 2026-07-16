@@ -901,12 +901,14 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
       );
       await db.limpiarConversaciones(from);
       // Mensaje de confirmación con resumen exacto — el campo 'mensaje_enviado' le indica a la IA que no lo repita
+      const avisoHorarioPedido = avisoFueraHorario();
       return {
         exito: true,
         resumen: resumenItems.join('\n'),
         total: formatearMoneda(total),
         mensaje_confirmacion: `¡Pedido confirmado! 🎉\n\n${resumenItems.join('\n')}\n\n*Total: ${formatearMoneda(total)}*\n\nUn asesor de DeCasa te contactará pronto para coordinar el pago y la entrega. ¡Gracias por elegir DeCasa! 😊`,
-        instruccion_ia: 'Comparte el mensaje_confirmacion tal cual al cliente, sin cambiar nada. Luego solo añade una frase corta de despedida.'
+        aviso_horario: avisoHorarioPedido,
+        instruccion_ia: `Comparte el mensaje_confirmacion tal cual al cliente, sin cambiar nada. Luego solo añade una frase corta de despedida.${avisoHorarioPedido ? ' Y como es fuera de horario, avísale que un asesor lo contactará en el próximo horario hábil para que no espere.' : ''}`
       };
     }
 
@@ -1008,7 +1010,7 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
           historial,
           'asesor'
         ).catch(e => console.error('[REDES] no se pudo notificar imagen no identificada:', e.message));
-        return { ok: true, escalado: true, mensaje: 'Se avisó a un asesor porque ya van varios intentos sin identificar la imagen. Coméntale al cliente que un asesor también le va a ayudar con esto, sin dejar de mostrarle opciones parecidas.' };
+        return { ok: true, escalado: true, aviso_horario: avisoFueraHorario(), mensaje: `Se avisó a un asesor porque ya van varios intentos sin identificar la imagen. Coméntale al cliente que un asesor también le va a ayudar con esto, sin dejar de mostrarle opciones parecidas.${avisoFueraHorario() ? ' Como es fuera de horario, avísale que el asesor le responderá en el próximo horario hábil para que no espere.' : ''}` };
       }
       return { ok: true, escalado: false, mensaje: 'Registrado. Sigue el flujo normal: pregunta si el cliente puede leer el nombre y muéstrale opciones parecidas según el tipo de mueble que identifiques.' };
     }
