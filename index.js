@@ -1047,6 +1047,14 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
 
 // ─── LLAMADA A OPENAI CON TOOL LOOP ──────────────────────────────────────────
 
+// Log del consumo de tokens de un turno, con costo estimado (tarifas gpt-4o:
+// $2.50/1M tokens de entrada, $10/1M de salida). Permite auditar el gasto desde los
+// logs sin depender solo del dashboard de OpenAI.
+function logUsoTokens(from, promptTok, completionTok, rondas, etiqueta = '') {
+  const costo = (promptTok / 1e6) * 2.5 + (completionTok / 1e6) * 10;
+  console.log(`[tokens]${etiqueta ? ' ' + etiqueta : ''} ${from} · ${rondas} ronda(s) · entrada ${promptTok} · salida ${completionTok} · ~$${costo.toFixed(4)}`);
+}
+
 async function callOpenAI(from, userMessage, historial) {
   const messages = [
     { role: 'system', content: buildSystemPrompt() },
@@ -1057,6 +1065,9 @@ async function callOpenAI(from, userMessage, historial) {
   // Puede haber múltiples imágenes (comparaciones)
   const imagenesParaEnviar = [];
 
+  // Contadores de tokens para auditar el gasto real por conversación.
+  let tokPrompt = 0, tokCompletion = 0;
+
   for (let ronda = 0; ronda < 6; ronda++) {
     const response = await openai.chat.completions.create({
       model: MODEL,
@@ -1066,6 +1077,11 @@ async function callOpenAI(from, userMessage, historial) {
       temperature: 0.7,
       max_tokens: 900
     });
+
+    if (response.usage) {
+      tokPrompt     += response.usage.prompt_tokens     ?? 0;
+      tokCompletion += response.usage.completion_tokens ?? 0;
+    }
 
     const choice = response.choices[0];
 
@@ -1100,10 +1116,12 @@ async function callOpenAI(from, userMessage, historial) {
 
     } else {
       const texto = choice.message.content || 'Disculpa, no pude generar una respuesta. Por favor intenta de nuevo. 😊';
+      logUsoTokens(from, tokPrompt, tokCompletion, ronda + 1);
       return { texto, imagenesParaEnviar };
     }
   }
 
+  logUsoTokens(from, tokPrompt, tokCompletion, 6);
   return {
     texto: 'Disculpa, tuve un problema procesando tu solicitud. Por favor intenta de nuevo. 😊',
     imagenesParaEnviar: []
@@ -1211,8 +1229,15 @@ app.post('/webhook', async (req, res) => {
                     { type: 'text', text: textoConMatch }
                   ]}
                 ];
+                const userMsgF = msgs[msgs.length - 1];
+                const textoUserF = userMsgF.content.find(c => c.type === 'text')?.text ?? '';
+                let tokPromptF = 0, tokCompletionF = 0;
                 for (let r = 0; r < 5; r++) {
                   const rv = await openai.chat.completions.create({ model: MODEL, messages: msgs, tools: TOOLS, tool_choice: 'auto', temperature: 0.7, max_tokens: 800 });
+                  if (rv.usage) {
+                    tokPromptF     += rv.usage.prompt_tokens     ?? 0;
+                    tokCompletionF += rv.usage.completion_tokens ?? 0;
+                  }
                   const cv = rv.choices[0];
                   if (cv.finish_reason === 'tool_calls' && cv.message.tool_calls) {
                     msgs.push({ role: 'assistant', content: cv.message.content || null, tool_calls: cv.message.tool_calls });
@@ -1225,12 +1250,15 @@ app.post('/webhook', async (req, res) => {
                       }
                       msgs.push({ role: 'tool', tool_call_id: tc.id, content: JSON.stringify(toolRes) });
                     }
+                    // Foto ya analizada en la ronda 0: la quitamos para no re-facturar visión.
+                    if (Array.isArray(userMsgF.content)) userMsgF.content = textoUserF;
                   } else {
                     const texto = cv.message.content || '¿Alguna te llama la atención?';
                     await twilioClient.messages.create({ from: toNumber, to: from, body: texto });
                     break;
                   }
                 }
+                logUsoTokens(from, tokPromptF, tokCompletionF, 5, 'vision-fallback');
               } catch (visionErr) { console.error('[VISION-FALLBACK]', visionErr.message); }
             })();
           }
@@ -1279,12 +1307,24 @@ NUNCA digas que no puedes identificar productos. Clasifica el tipo y muestra el 
           let respuesta = '';
           const imgs = [];
 
+          // Referencia al mensaje con la imagen + su texto, para quitar la foto en las
+          // rondas siguientes (ya se analizó a máxima calidad en la ronda 0).
+          const userMsgV = msgs[msgs.length - 1];
+          const textoUserV = Array.isArray(userMsgV.content)
+            ? (userMsgV.content.find(c => c.type === 'text')?.text ?? '')
+            : userMsgV.content;
+          let tokPromptV = 0, tokCompletionV = 0;
+
           // Loop de herramientas (hasta 5 rondas): permite buscar Y enviar fotos en el mismo turno
           for (let ronda = 0; ronda < 5; ronda++) {
             const rv = await openai.chat.completions.create({
               model: MODEL, messages: msgs, tools: TOOLS, tool_choice: 'auto',
               temperature: 0.7, max_tokens: 800
             });
+            if (rv.usage) {
+              tokPromptV     += rv.usage.prompt_tokens     ?? 0;
+              tokCompletionV += rv.usage.completion_tokens ?? 0;
+            }
             const cv = rv.choices[0];
 
             if (cv.finish_reason === 'tool_calls' && cv.message.tool_calls) {
@@ -1300,11 +1340,16 @@ NUNCA digas que no puedes identificar productos. Clasifica el tipo y muestra el 
                 }
                 msgs.push({ role: 'tool', tool_call_id: tc.id, content: JSON.stringify(toolRes) });
               }
+              // La foto ya se analizó a máxima calidad en la ronda 0. En las siguientes
+              // el modelo solo procesa resultados de herramientas y no necesita "verla"
+              // de nuevo — la quitamos para no re-facturar los tokens de visión (caros).
+              if (Array.isArray(userMsgV.content)) userMsgV.content = textoUserV;
             } else {
               respuesta = cv.message.content || '¿Puedo ayudarte con algo más? 😊';
               break;
             }
           }
+          logUsoTokens(from, tokPromptV, tokCompletionV, 5, 'vision');
           if (!respuesta) respuesta = '¿Puedo ayudarte con algo más? 😊';
 
           await db.addMensaje(from, 'user', contextoUsuario);
