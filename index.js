@@ -15,6 +15,30 @@ function alertarTelegramCrash(tipo, err) {
   }).catch(() => {});
 }
 
+// Alerta genérica (no solo crashes): la usa la validación de precios y cualquier
+// chequeo de calidad. Evita inundar Telegram con la misma alerta: como mucho una
+// vez cada 10 minutos por título.
+const _ultimaAlerta = new Map();
+const _SILENCIO_ALERTA_MS = 10 * 60 * 1000;
+function alertar(titulo, detalle) {
+  console.error(`[ALERTA] ${titulo}:`, detalle);
+  const ahora = Date.now();
+  if (ahora - (_ultimaAlerta.get(titulo) ?? 0) < _SILENCIO_ALERTA_MS) return;
+  _ultimaAlerta.set(titulo, ahora);
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  const chatId = process.env.TELEGRAM_CHAT_ID;
+  if (!token || !chatId) return;
+  fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      chat_id: chatId,
+      text: `🚨 <b>${titulo} — Elena DeCasa (WhatsApp)</b>\n<code>${String(detalle).substring(0, 400)}</code>`,
+      parse_mode: 'HTML'
+    })
+  }).catch(() => {});
+}
+
 process.on('uncaughtException', (err) => {
   console.error('[FATAL] ERROR NO CAPTURADO:', err);
   alertarTelegramCrash('ERROR CRÍTICO NO CAPTURADO', err);
@@ -47,6 +71,52 @@ const MODEL = process.env.OPENAI_MODEL || 'gpt-4o';
 let inventario = {};
 // Catálogos cargados desde BD (actualizables sin redeploy)
 let catalogosDB = Object.assign({}, knowledge.catalogos || {});
+// Precios válidos conocidos del inventario, para detectar precios inventados por Elena.
+let preciosInventario = new Set();
+
+// Reconstruye el Set de precios válidos a partir del inventario cargado (objeto por categoría).
+function recalcularPreciosInventario() {
+  const set = new Set();
+  for (const cat of Object.values(inventario)) {
+    for (const p of cat.productos || []) {
+      const n = Number(p.precio ?? 0);
+      if (n) set.add(n);
+    }
+  }
+  preciosInventario = set;
+}
+
+// Precios válidos conocidos, inyectable para tests (en producción lo llena cargarInventario).
+function setPreciosInventarioParaPruebas(nums) {
+  preciosInventario = new Set(nums);
+}
+
+// Extrae montos en pesos de un texto: "$3.380.000", "3.380.000", "$780000"...
+// Solo considera valores >= 10.000 para no confundir medidas ("1.80") ni cantidades.
+function extraerPrecios(texto) {
+  const nums = [];
+  const re = /\$?\s*(\d{1,3}(?:[.,]\d{3})+|\d{5,})/g;
+  let m;
+  while ((m = re.exec(texto ?? '')) !== null) {
+    const n = parseInt(m[1].replace(/[.,]/g, ''));
+    if (n >= 10000) nums.push(n);
+  }
+  return nums;
+}
+
+// Monitorea precios inventados: cualquier precio en la respuesta que no exista en el
+// inventario ni haya salido de una herramienta en este turno (p.ej. total de carrito)
+// es sospechoso. No se bloquea el mensaje (evita romper la conversación por un falso
+// positivo), pero se alerta para poder corregir el prompt si Elena empieza a inventar.
+function validarPrecios(telefono, texto, preciosVistos) {
+  const sospechosos = extraerPrecios(texto).filter(
+    n => !preciosInventario.has(n) && !preciosVistos.has(n)
+  );
+  if (sospechosos.length) {
+    alertar('Posible precio inventado por Elena', `tel=${telefono} precios=${sospechosos.join(', ')} | msg="${String(texto).substring(0, 160)}"`);
+  }
+  return sospechosos; // devuelto para poder testearlo; el caller no necesita usarlo
+}
 
 async function cargarInventario() {
   try {
@@ -54,7 +124,8 @@ async function cargarInventario() {
     if (nuevo && Object.keys(nuevo).length > 0) {
       inventario = nuevo;
       utils.setInventario(inventario);
-      console.log('[INVENTARIO] ✅ Cargado:', Object.keys(inventario).length, 'categorías');
+      recalcularPreciosInventario();
+      console.log('[INVENTARIO] ✅ Cargado:', Object.keys(inventario).length, 'categorías,', preciosInventario.size, 'precios');
     }
   } catch (err) {
     console.error('[INVENTARIO] ❌ Error:', err.message);
@@ -318,9 +389,28 @@ async function enviarMensajeAdicional(from, toNumber, body, mediaUrl) {
 
 // ─── BÚSQUEDA EN INVENTARIO ───────────────────────────────────────────────────
 
+// El cliente pide "4 puestos/personas" y en el catálogo eso vive en medidas como
+// "(4 Puestos)". Da un empujón fuerte al producto cuyo nº de puestos coincide, para
+// que las bases del tamaño pedido queden de primeras.
+function boostPuestos(q, medidas) {
+  const pedido = q.match(/(\d+)\s*(puesto|persona|sitio)/);
+  if (!pedido) return 0;
+  return new RegExp('\\b' + pedido[1] + '\\s*puesto').test(normalizarTexto(medidas || '')) ? 45 : 0;
+}
+
+// "redonda/circular/forma de copa/pedestal": en el catálogo las bases redondas de
+// pedestal dicen "Diametro" en medidas (o "REDONDA" en el nombre). Sin esto, "mesa
+// redonda" o "en forma de copa" no encontraban ninguna.
+function boostForma(q, medidas, nombre) {
+  if (!/\b(redond[oa]|circular|copa|pedestal|columna)\b/.test(q)) return 0;
+  return (normalizarTexto(medidas || '').includes('diametro') || /redond/.test(normalizarTexto(nombre || ''))) ? 35 : 0;
+}
+
 function buscarEnInventario(consulta, categoria, limite = 6) {
   const q = normalizarTexto(consulta);
-  const palabras = q.split(/\s+/).filter(p => p.length >= 2);
+  // Se conservan los números de 1 dígito (p.ej. "4" puestos); las demás palabras deben
+  // tener ≥2 letras para no meter ruido.
+  const palabras = q.split(/\s+/).filter(p => p.length >= 2 || /^\d+$/.test(p));
 
   const cats = categoria && inventario[categoria]
     ? { [categoria]: inventario[categoria] }
@@ -332,10 +422,12 @@ function buscarEnInventario(consulta, categoria, limite = 6) {
     for (const prod of catData.productos) {
       const nombre = normalizarTexto(prod.nombre);
       const material = normalizarTexto(prod.material || '');
+      const medidas = normalizarTexto(prod.medidas || '');
       let score = 0;
       for (const p of palabras) {
         if (nombre.includes(p)) score += p.length * 2;
         else if (material.includes(p)) score += p.length;
+        else if (medidas.includes(p)) score += p.length;
         // Fuzzy: acepta palabras similares con 1 carácter diferente
         else if (p.length >= 5) {
           for (const pn of nombre.split(/\s+/)) {
@@ -345,6 +437,10 @@ function buscarEnInventario(consulta, categoria, limite = 6) {
           }
         }
       }
+      // Empujones por nº de puestos y forma (comedores) — clave para "4 puestos",
+      // "mesa redonda", "en forma de copa".
+      score += boostPuestos(q, prod.medidas);
+      score += boostForma(q, prod.medidas, prod.nombre);
       if (score > 0) {
         resultados.push({
           nombre: prod.nombre, precio: prod.precio,
@@ -440,6 +536,7 @@ sofas | sofas_modulares | sofas_camas | cajoneros_bifes | escritorios | colchone
 INSTRUCCIONES OBLIGATORIAS:
 1. SIEMPRE usa buscar_productos antes de mencionar cualquier producto o precio
 2. NUNCA inventes precios, nombres o disponibilidad — solo lo que veas en el inventario
+2b. Usa el NOMBRE EXACTO del producto tal como lo devuelve la herramienta, palabra por palabra. NO le agregues, quites ni cambies palabras: si el producto es "BASE FIGY RECTA" no digas "Mesa de barra Figy Recta" ni "Comedor Figy"; si es "BASE 2K" no lo llames de otra forma. El nombre real es el que devuelve la herramienta, y ese mismo nombre es el que debes usar en agregar_al_carrito y enviar_foto.
 3. Cuando el cliente mencione un presupuesto o diga "barato/económico" → usa buscar_por_presupuesto
 4. Cuando el cliente pregunte sobre disponibilidad ("¿tienes X?", "¿hay X?", "¿en qué tienda está?", "¿dónde lo puedo ver?") → responde siempre: "¡Seguramente sí! 😊 En DeCasa manejamos buen stock y lo que no tengamos en tienda lo fabricamos al mismo precio desde nuestro taller. ¿Quieres que te comunique con un asesor para confirmar disponibilidad y coordinar?" — luego espera su respuesta. Si el cliente dice que sí quiere confirmar → llama transferir_asesor. NUNCA menciones una tienda específica.
 4. Para ver carrito → llama ver_carrito
@@ -464,6 +561,9 @@ ENTREGA Y VISITAS:
 - Si el cliente dice que quiere ir a verlo ("quiero verlo", "voy a la tienda", "prefiero ir", "paso por allá") → invítalo a agendar una cita: "¡Perfecto! Para que te atendamos bien y tengamos el producto listo, agendemos tu visita 😊 ¿Cómo te llamas?" y sigue el flujo de agendar_cita
 - COSTO DE ENVÍO: GRATIS en todo el Quindío y en Pereira (Risaralda). Para destinos fuera del Quindío o Risaralda hay un costo adicional de transportadora — infórmalo y pregunta: "¿Quieres que te comunique con un asesor para que te dé el valor exacto del envío?" → solo transfiere si el cliente dice que sí
 - Para preguntas sobre tiempo de entrega, instalación o garantía → transfiere al asesor
+
+PROVEEDORES Y PROPUESTAS COMERCIALES:
+- Si quien escribe NO quiere comprar sino VENDERLE a DeCasa o proponer una alianza (dice que es proveedor/fabricante/importador, ofrece materia prima, tapas, piedra, telas, etc., quiere mandar su portafolio o "trabajar juntos") → NO es un cliente. Llama reportar_proveedor con un resumen de qué ofrece y su nombre/empresa. NO le agendes visita, NO le des ningún número ni WhatsApp, NO le hables de productos del catálogo. Solo agradece y dile que su propuesta la revisará nuestro equipo de compras y lo contactarán por aquí si hay interés.
 
 RESTAURACIONES Y REPARACIONES:
 - En DeCasa SÍ ofrecemos servicio de restauración y reparación de muebles (restaurar, reparar, arreglar, renovar, retapizar muebles usados o viejos). NUNCA digas que no hacemos restauraciones — sí las hacemos.
@@ -495,6 +595,7 @@ TÉRMINOS AMBIGUOS — pregunta ANTES de buscar:
 - "sofá/sofas" sin más contexto → "¿Buscas sofá tradicional, sofá modular o sofá cama?"
 - "comedor" / "juego de comedor" / "conjunto comedor" → "¡Ojo importante! 😊 En DeCasa la base (mesa) y las sillas se venden por separado. ¿Buscas la base, las sillas, o te muestro ambas para que armes tu juego completo?"
 No hagas esta pregunta si el cliente YA especificó el tipo (ej: "sillas de comedor", "base de comedor").
+- Cuando el cliente busca una BASE/mesa de comedor y dice número de puestos ("de 4 puestos", "para 6 personas") o forma ("redonda", "en forma de copa", "ovalada"), llama buscar_productos con categoria='bases_comedores' y pásale esos datos TAL CUAL en la consulta (ej: consulta="4 puestos", "redonda") — la búsqueda ya los entiende y prioriza las bases del tamaño/forma pedidos.
 
 REGLAS DE VENTA:
 - Sillas se venden por UNIDAD, separadas de las bases de comedor
@@ -549,13 +650,13 @@ const TOOLS = [
     type: 'function',
     function: {
       name: 'buscar_productos',
-      description: 'Busca productos en el catálogo por nombre, descripción o categoría. Solo devuelve precio, material y medidas. NO incluye stock ni disponibilidad en tiendas.',
+      description: 'Busca productos en el catálogo por nombre, descripción o categoría. Entiende también el número de puestos de una mesa/comedor ("4 puestos", "6 personas") y la forma ("redonda", "en forma de copa", "ovalada") — inclúyelos en la consulta tal como los dijo el cliente. Solo devuelve precio, material y medidas. NO incluye stock ni disponibilidad en tiendas.',
       parameters: {
         type: 'object',
         properties: {
           consulta: {
             type: 'string',
-            description: 'Texto de búsqueda: nombre del producto o descripción (ej: "cama doble", "silla comedor", "sofa modular")'
+            description: 'Texto de búsqueda: nombre, descripción, nº de puestos o forma (ej: "cama doble", "comedor 4 puestos", "mesa redonda", "base en forma de copa", "sofa modular")'
           },
           categoria: {
             type: 'string',
@@ -712,6 +813,20 @@ const TOOLS = [
       }
     }
   },
+  {
+    type: 'function',
+    function: {
+      name: 'reportar_proveedor',
+      description: 'Úsalo cuando la persona NO es un cliente sino un PROVEEDOR o alguien que quiere VENDERLE a DeCasa o proponer una colaboración/alianza comercial (ej: "somos importadores/fabricantes de X", "quiero enviarles mi portafolio", "les ofrezco materia prima/tapas/piedra", "propuesta comercial", "trabajar juntos"). NO lo trates como cliente, NO agendes visita, NO le des ningún número. Solo se notifica internamente al equipo de compras.',
+      parameters: {
+        type: 'object',
+        properties: {
+          resumen: { type: 'string', description: 'Qué ofrece y el nombre/empresa de la persona si lo mencionó' }
+        },
+        required: ['resumen']
+      }
+    }
+  },
 ];
 
 // Horario real de atención: Lun-Vie 8am-5pm, Sáb 8am-12pm, domingo cerrado.
@@ -739,6 +854,39 @@ function avisoFueraHorario() {
 
 // ─── EJECUTAR HERRAMIENTAS ────────────────────────────────────────────────────
 
+// Registro de eventos para métricas, fire-and-forget: nunca debe romper el flujo ni
+// hacer esperar al cliente.
+function evento(telefono, tipo, detalle) {
+  db.registrarEvento(telefono, tipo, detalle).catch(e => console.error('[metricas] evento falló:', e.message));
+}
+
+// Guarda (compacto) los productos que se le acaban de mostrar al cliente, para poder
+// resolver "esa / la segunda / la de $X" en el mensaje siguiente. No debe romper el
+// flujo si falla.
+async function recordarMostrados(from, productos) {
+  try {
+    await db.setUltimosMostrados(from, productos.slice(0, 6).map(p => ({
+      nombre: p.nombre, precio: p.precio
+    })));
+  } catch (e) { console.warn('[mostrados] no se pudo guardar:', e.message); }
+}
+
+// Construye una instrucción de contexto con los productos recién mostrados al cliente,
+// para que Elena resuelva "esa / la segunda / la de $X" con el nombre EXACTO. Efímero:
+// no se guarda en historial. Devuelve null si no hay nada vigente.
+async function construirContextoMostrados(from) {
+  try {
+    const mostrados = await db.getUltimosMostrados(from);
+    if (!mostrados?.length) return null;
+    const lista = mostrados.map((p, i) => {
+      const n = Number(String(p.precio ?? '').replace(/[^\d]/g, ''));
+      const precio = n ? `$${n.toLocaleString('es-CO')}` : String(p.precio ?? '');
+      return `${i + 1}) ${p.nombre}${precio ? ` — ${precio}` : ''}`;
+    }).join('; ');
+    return `Productos que le mostraste al cliente hace un momento: ${lista}. Si el cliente dice "esa", "la segunda", "la primera", "la de $X", "la última", etc., se refiere a uno de estos — resuélvelo con esta lista y usa el nombre EXACTO.`;
+  } catch { return null; }
+}
+
 async function ejecutarHerramienta(nombre, args, from, historial) {
   const telefono = from.replace('whatsapp:', '');
 
@@ -746,6 +894,7 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
 
     case 'buscar_productos': {
       const { consulta, categoria, limite = 5 } = args;
+      evento(telefono, 'busqueda', consulta);
       const resultados = buscarEnInventario(consulta, categoria, Math.min(Number(limite) || 5, 10));
       if (resultados.length === 0) {
         return {
@@ -754,6 +903,8 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
           sugerencia: 'Prueba con otra categoría o un término diferente.'
         };
       }
+      for (const p of resultados) evento(telefono, 'producto_visto', p.nombre);
+      await recordarMostrados(from, resultados);
       return {
         encontrados: resultados.length,
         productos: resultados.map(p => ({
@@ -781,6 +932,8 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
           mensaje: `No encontré productos en ${formatearMoneda(presupuesto)}.${masBarato ? ` El más económico en ${masBarato.categoriaNombre} es ${masBarato.nombre} a ${masBarato.precio}.` : ''}`
         };
       }
+      for (const p of resultados) evento(telefono, 'producto_visto', p.nombre);
+      await recordarMostrados(from, resultados);
       return {
         encontrados: resultados.length,
         presupuesto: formatearMoneda(presupuesto),
@@ -900,6 +1053,7 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
       }
       await db.marcarPedidoConfirmado(from);
       await db.resetearEstadoSinPedido(from);
+      evento(telefono, 'pedido', `$${total.toLocaleString('es-CO')}`);
       enviarNotificacionTelegram(telefono, resumenItems.join('\n'), historial, 'pedido', { carrito: items }).catch(e =>
         console.error('[REDES] Error notificacion pedido:', e.message)
       );
@@ -926,6 +1080,7 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
         };
       }
       // Actualizar último producto visto (imagen incluida para visualización)
+      evento(telefono, 'producto_visto', resultado.nombre);
       await db.setUltimoProducto(from, { nombre: resultado.nombre, imagen: resultado.imagen || null, ts: Date.now() });
       // No devolver el URL al modelo: evita que lo escriba en el texto como markdown
       return { exito: true, nombre: resultado.nombre, _imagenUrl: resultado.imagen, _imagen2Url: resultado.imagen2 || null, mensaje: `Foto de ${resultado.nombre} enviada al cliente.` };
@@ -987,6 +1142,7 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
       const motivoFinal = motivo || null
       const datosCita  = { nombre: nombreLimpio, ubicacion: Number(ubicacion), sede_nombre: sedeNombre, dia: diaCapitalizado, hora: horaFormateada, motivo: motivoFinal }
 
+      evento(telefono, 'cita', `${sedeNombre} — ${diaCapitalizado} ${horaFormateada}`)
       const resumenCita = `${nombreLimpio} — ${sedeNombre} — ${diaCapitalizado} ${horaFormateada}${motivoFinal ? ` — ${motivoFinal}` : ''}`
       await enviarNotificacionTelegram(
         telefono,
@@ -1004,6 +1160,7 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
     }
 
     case 'reportar_imagen_no_identificada': {
+      evento(telefono, 'imagen_no_identificada');
       const intentos = (_capturasNoIdentificadas.get(telefono) ?? 0) + 1;
       _capturasNoIdentificadas.set(telefono, intentos);
       if (intentos >= 2) {
@@ -1033,11 +1190,22 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
         const resumenCarrito = carritoActual.map(i => `${i.producto} ×${i.cantidad || 1}`).join(', ');
         razonFinal += `\nCarrito: ${resumenCarrito}`;
       }
+      evento(telefono, 'transferencia', razon);
       await enviarNotificacionTelegram(telefono, razonFinal, historial, 'asesor', { carrito: carritoActual.length ? carritoActual : undefined });
       await db.marcarTransferida(from);
       await db.limpiarConversaciones(from);
       const aviso = avisoFueraHorario()
       return { exito: true, mensaje: 'Asesor notificado.', aviso_horario: aviso };
+    }
+
+    case 'reportar_proveedor': {
+      // El número del encargado va SOLO en la notificación interna (el equipo lo ve en
+      // el sistema de ventas), nunca en la respuesta al proveedor.
+      const resumenProv = `PROVEEDOR / PROPUESTA COMERCIAL 🏭\n${args.resumen || 'Sin detalle'}\nReenviar al encargado de compras (WhatsApp 3148622755).`;
+      evento(telefono, 'proveedor', (args.resumen ?? '').substring(0, 120));
+      enviarNotificacionTelegram(telefono, resumenProv, historial, 'otro').catch(e =>
+        console.error('[REDES] no se pudo notificar proveedor:', e.message));
+      return { ok: true, mensaje: 'Registrado como propuesta de proveedor/colaboración. Agradécele con amabilidad, dile que su propuesta ya fue enviada a nuestro equipo de compras y que lo contactarán por este mismo medio si hay interés. NO agendes visita, NO le des ningún número, NO le pidas datos como si fuera un cliente.' };
     }
 
     default:
@@ -1056,8 +1224,15 @@ function logUsoTokens(from, promptTok, completionTok, rondas, etiqueta = '') {
 }
 
 async function callOpenAI(from, userMessage, historial) {
+  const contextoMostrados = await construirContextoMostrados(from);
+  const reactivado = await db.consumirReactivacionAsesor(from);
+  const notaReactivacion = reactivado
+    ? 'Este cliente venía siendo atendido por un asesor humano y la conversación acaba de volver a ti. NO arranques de cero ni repitas el saludo largo de bienvenida: reconoce que ya venía en conversación (usa el historial para ver qué buscaba) y pregúntale amablemente en qué le puedes seguir ayudando o cómo quedó con el asesor. Si necesita de nuevo un asesor, transfiérelo.'
+    : null;
   const messages = [
     { role: 'system', content: buildSystemPrompt() },
+    ...(notaReactivacion ? [{ role: 'system', content: notaReactivacion }] : []),
+    ...(contextoMostrados ? [{ role: 'system', content: contextoMostrados }] : []),
     ...historial.map(m => ({ role: m.role, content: m.content })),
     { role: 'user', content: userMessage }
   ];
@@ -1067,6 +1242,8 @@ async function callOpenAI(from, userMessage, historial) {
 
   // Contadores de tokens para auditar el gasto real por conversación.
   let tokPrompt = 0, tokCompletion = 0;
+  // Precios que salieron de herramientas en este turno (p.ej. total de carrito): son válidos.
+  const preciosVistos = new Set();
 
   for (let ronda = 0; ronda < 6; ronda++) {
     const response = await openai.chat.completions.create({
@@ -1107,20 +1284,24 @@ async function callOpenAI(from, userMessage, historial) {
           if (resultado._imagen2Url) imagenesParaEnviar.push({ url: resultado._imagen2Url, nombre: resultado.nombre });
         }
 
+        const resultadoStr = JSON.stringify(resultado);
+        for (const n of extraerPrecios(resultadoStr)) preciosVistos.add(n);
         messages.push({
           role: 'tool',
           tool_call_id: toolCall.id,
-          content: JSON.stringify(resultado)
+          content: resultadoStr
         });
       }
 
     } else {
       const texto = choice.message.content || 'Disculpa, no pude generar una respuesta. Por favor intenta de nuevo. 😊';
+      validarPrecios(from, texto, preciosVistos);
       logUsoTokens(from, tokPrompt, tokCompletion, ronda + 1);
       return { texto, imagenesParaEnviar };
     }
   }
 
+  evento(from, 'sin_resolver', 'limite de rondas');
   logUsoTokens(from, tokPrompt, tokCompletion, 6);
   return {
     texto: 'Disculpa, tuve un problema procesando tu solicitud. Por favor intenta de nuevo. 😊',
@@ -1173,6 +1354,13 @@ app.post('/webhook', async (req, res) => {
   try {
     await db.verificarYLimpiarInactividad(from);
     await db.getOrCreateUsuario(from);
+
+    // Métrica: una conversación nueva empieza cuando no hay historial previo (tras el
+    // posible limpiado por inactividad de arriba). Fire-and-forget, no bloquea el flujo.
+    try {
+      const previa = await db.getHistorial(from, 1);
+      if (!previa || previa.length === 0) evento(from, 'conversacion');
+    } catch { /* métrica no crítica */ }
 
     // ── IMAGEN RECIBIDA DEL CLIENTE ─────────────────────────────────
     if (mediaUrl && mediaType?.startsWith('image/')) {
@@ -1232,6 +1420,7 @@ app.post('/webhook', async (req, res) => {
                 const userMsgF = msgs[msgs.length - 1];
                 const textoUserF = userMsgF.content.find(c => c.type === 'text')?.text ?? '';
                 let tokPromptF = 0, tokCompletionF = 0;
+                const preciosVistosF = new Set();
                 for (let r = 0; r < 5; r++) {
                   const rv = await openai.chat.completions.create({ model: MODEL, messages: msgs, tools: TOOLS, tool_choice: 'auto', temperature: 0.7, max_tokens: 800 });
                   if (rv.usage) {
@@ -1248,12 +1437,15 @@ app.post('/webhook', async (req, res) => {
                         if (toolRes._imagenUrl) await twilioClient.messages.create({ from: toNumber, to: from, body: `📸 ${toolRes.nombre}`, mediaUrl: [toolRes._imagenUrl] });
                         if (toolRes._imagen2Url) await twilioClient.messages.create({ from: toNumber, to: from, body: `📸 ${toolRes.nombre}`, mediaUrl: [toolRes._imagen2Url] });
                       }
-                      msgs.push({ role: 'tool', tool_call_id: tc.id, content: JSON.stringify(toolRes) });
+                      const toolResStr = JSON.stringify(toolRes);
+                      for (const n of extraerPrecios(toolResStr)) preciosVistosF.add(n);
+                      msgs.push({ role: 'tool', tool_call_id: tc.id, content: toolResStr });
                     }
                     // Foto ya analizada en la ronda 0: la quitamos para no re-facturar visión.
                     if (Array.isArray(userMsgF.content)) userMsgF.content = textoUserF;
                   } else {
                     const texto = cv.message.content || '¿Alguna te llama la atención?';
+                    validarPrecios(from, texto, preciosVistosF);
                     await twilioClient.messages.create({ from: toNumber, to: from, body: texto });
                     break;
                   }
@@ -1281,7 +1473,7 @@ app.post('/webhook', async (req, res) => {
 
 INSTRUCCIÓN PARA IMÁGENES: Cuando el cliente envía una foto:
 0. Si es una CAPTURA DE PANTALLA de una publicación de red social (se ve interfaz de la app, texto de descripción, nombre de usuario, etc. — muy común en clientes mayores que no saben usar "compartir" y en su lugar mandan un screenshot): primero intenta LEER cualquier texto visible que pueda ser el nombre del producto. Si logras leer un nombre y aparece en el inventario, llama buscar_productos con ese nombre exacto y preséntalo directamente. Si la captura se ve claramente recortada arriba (el encabezado o la descripción quedan tapados por la barra de estado del celular) dile al cliente que en vez de una captura comparta la publicación o foto directamente — así se puede leer el nombre completo. Si NO logras leer un nombre, o no aparece en el inventario: llama reportar_imagen_no_identificada, dile al cliente algo como "No alcancé a ver el nombre del producto en la imagen 🙏 ¿me dices si tú lo alcanzas a leer, o qué tipo de mueble es? Mientras tanto te muestro opciones parecidas:" y continúa con el paso 1 usando el tipo de mueble que identifiques visualmente.
-0b. Si el mensaje del sistema ya dice "La imagen coincide con este producto de nuestro catálogo": es una coincidencia automática por comparación de foto, no una adivinanza — llama buscar_productos con ese nombre exacto y preséntalo directamente, saltando el paso 0.
+0b. Si el mensaje del sistema ya dice "La imagen coincide con este producto de nuestro catálogo": es una coincidencia automática por comparación de foto, no una adivinanza — llama buscar_productos con ese nombre exacto y preséntalo directamente, saltando el paso 0. Preséntalo con el nombre, precio, medidas y material EXACTOS que devuelva la herramienta, palabra por palabra: NUNCA cambies ni acortes el nombre, NUNCA inventes medidas ni material, y NO describas lo que "ves" en la foto si contradice esos datos — el catálogo manda. Si algún dato no aparece, dile al cliente que ese detalle lo confirma un asesor.
 1. Identifica el TIPO de mueble (silla de comedor, sofá, cama, mesa, etc.) y la CATEGORÍA del catálogo.
 2. Llama buscar_productos DOS VECES:
    a) Primera con la categoría exacta y limite:10 para obtener TODOS los productos de esa línea.
@@ -1292,8 +1484,10 @@ INSTRUCCIÓN PARA IMÁGENES: Cuando el cliente envía una foto:
 NUNCA preguntes "¿quieres ver la foto?" — envíala directamente.
 NUNCA digas que no puedes identificar productos. Clasifica el tipo y muestra el catálogo completo de esa categoría.`;
 
+          const contextoMostradosV = await construirContextoMostrados(from);
           const msgs = [
             { role: 'system', content: systemVision },
+            ...(contextoMostradosV ? [{ role: 'system', content: contextoMostradosV }] : []),
             ...historial.map(m => ({ role: m.role, content: m.content })),
             {
               role: 'user',
@@ -1314,6 +1508,7 @@ NUNCA digas que no puedes identificar productos. Clasifica el tipo y muestra el 
             ? (userMsgV.content.find(c => c.type === 'text')?.text ?? '')
             : userMsgV.content;
           let tokPromptV = 0, tokCompletionV = 0;
+          const preciosVistosV = new Set();
 
           // Loop de herramientas (hasta 5 rondas): permite buscar Y enviar fotos en el mismo turno
           for (let ronda = 0; ronda < 5; ronda++) {
@@ -1338,7 +1533,9 @@ NUNCA digas que no puedes identificar productos. Clasifica el tipo y muestra el 
                   if (toolRes._imagenUrl) imgs.push({ url: toolRes._imagenUrl, nombre: toolRes.nombre });
                   if (toolRes._imagen2Url) imgs.push({ url: toolRes._imagen2Url, nombre: toolRes.nombre });
                 }
-                msgs.push({ role: 'tool', tool_call_id: tc.id, content: JSON.stringify(toolRes) });
+                const toolResStr = JSON.stringify(toolRes);
+                for (const n of extraerPrecios(toolResStr)) preciosVistosV.add(n);
+                msgs.push({ role: 'tool', tool_call_id: tc.id, content: toolResStr });
               }
               // La foto ya se analizó a máxima calidad en la ronda 0. En las siguientes
               // el modelo solo procesa resultados de herramientas y no necesita "verla"
@@ -1346,6 +1543,7 @@ NUNCA digas que no puedes identificar productos. Clasifica el tipo y muestra el 
               if (Array.isArray(userMsgV.content)) userMsgV.content = textoUserV;
             } else {
               respuesta = cv.message.content || '¿Puedo ayudarte con algo más? 😊';
+              validarPrecios(from, respuesta, preciosVistosV);
               break;
             }
           }
@@ -1621,4 +1819,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { app, startServer };
+module.exports = { app, startServer, extraerPrecios, validarPrecios, setPreciosInventarioParaPruebas };

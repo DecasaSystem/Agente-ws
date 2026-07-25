@@ -173,6 +173,18 @@ async function initDB() {
       `);
       console.log('✅ Columna presupuesto añadida');
     }
+    if (!nombresColsEstado.includes('ultimos_mostrados')) {
+      await connection.query(`
+        ALTER TABLE estado_usuario ADD COLUMN ultimos_mostrados JSON
+      `);
+      console.log('✅ Columna ultimos_mostrados añadida');
+    }
+    if (!nombresColsEstado.includes('transferido_at')) {
+      await connection.query(`
+        ALTER TABLE estado_usuario ADD COLUMN transferido_at JSON
+      `);
+      console.log('✅ Columna transferido_at añadida');
+    }
 
     // Cache de perceptual hash (dHash) de las fotos de productos, para poder
     // identificar por comparación de imagen cuando un cliente reenvía/captura una
@@ -187,6 +199,21 @@ async function initDB() {
       )
     `);
     console.log('✅ Tabla producto_imagen_hash creada o verificada');
+
+    // Eventos para métricas de negocio del bot de WhatsApp (conversaciones, búsquedas,
+    // productos vistos, transferencias, citas, pedidos, consultas sin resolver). Tabla
+    // propia del agente, análoga a ig_eventos; el panel de Redes la lee para el embudo.
+    await connection.query(`
+      CREATE TABLE IF NOT EXISTS wa_eventos (
+        id         BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+        telefono   VARCHAR(50),
+        tipo       VARCHAR(40) NOT NULL,
+        detalle    VARCHAR(255),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_tipo_created (tipo, created_at)
+      )
+    `);
+    console.log('✅ Tabla wa_eventos creada o verificada');
 
     console.log('\n🎉 Base de datos lista!\n');
     

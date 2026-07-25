@@ -180,6 +180,8 @@ async function getEstado(telefono) {
     comparacion_pendiente: parseJSONField(estado.comparacion_pendiente),
     comparacion_productos: parseJSONField(estado.comparacion_productos),
     transferencia_medida_pendiente: parseJSONField(estado.transferencia_medida_pendiente),
+    ultimos_mostrados: parseJSONField(estado.ultimos_mostrados),
+    transferido_at: parseJSONField(estado.transferido_at),
     presupuesto: estado.presupuesto || null
   };
 }
@@ -201,6 +203,8 @@ function _estadoVacio() {
     comparacion_pendiente: null,
     comparacion_productos: null,
     transferencia_medida_pendiente: null,
+    ultimos_mostrados: null,
+    transferido_at: null,
     presupuesto: null
   };
 }
@@ -224,7 +228,7 @@ async function updateEstado(telefono, datos) {
 
   const camposJSON = ['producto_pendiente', 'carrito', 'datos_agenda', 'candidatos_pendientes',
     'subtipo_pendiente', 'comparacion_pendiente', 'comparacion_productos',
-    'ultimo_producto', 'transferencia_medida_pendiente'];
+    'ultimo_producto', 'transferencia_medida_pendiente', 'ultimos_mostrados', 'transferido_at'];
 
   const camposBool = ['transferido', 'greeting_sent', 'tiene_pedido', 'agendando_cita'];
 
@@ -320,8 +324,35 @@ async function estaTransferida(telefono) {
   return estado.transferido;
 }
 
+// Registra un evento de negocio para métricas (fire-and-forget desde el caller). Se
+// guarda solo el teléfono limpio, el tipo y un detalle corto — nada sensible.
+async function registrarEvento(telefono, tipo, detalle = null) {
+  const tel = telefono ? String(telefono).replace('whatsapp:', '') : null;
+  await pool.query(
+    'INSERT INTO wa_eventos (telefono, tipo, detalle) VALUES (?, ?, ?)',
+    [tel, tipo, detalle ? String(detalle).substring(0, 255) : null]
+  );
+}
+
 async function marcarTransferida(telefono) {
-  await updateEstado(telefono, { transferido: true });
+  // Se guarda el momento de la transferencia para poder detectar la reactivación:
+  // cuando el asesor libera la conversación (botón "Terminar" o timeout), la IA debe
+  // retomar reconociendo que el cliente ya venía siendo atendido, no arrancar de cero.
+  await updateEstado(telefono, { transferido: true, transferido_at: Date.now() });
+}
+
+// Detecta si la IA está retomando una conversación que hace poco tenía un asesor.
+// Devuelve true una sola vez (consume la marca) si: ya NO está transferida y la marca
+// de transferencia es reciente (dentro de maxHoras). Limpia marcas viejas o ya usadas.
+// No funciona con lo que el asesor escribió (en WhatsApp el asesor responde desde su
+// propio número vía wa.me, así que esos mensajes no llegan a este agente), pero sí
+// permite retomar con contexto sin repetir el saludo largo.
+async function consumirReactivacionAsesor(telefono, maxHoras = 12) {
+  const estado = await getEstado(telefono);
+  const ts = estado.transferido_at;
+  if (estado.transferido || !ts) return false;
+  await updateEstado(telefono, { transferido_at: null });
+  return (Date.now() - Number(ts)) <= maxHoras * 60 * 60 * 1000;
 }
 
 async function haEnviadoSaludo(telefono) {
@@ -356,6 +387,20 @@ async function getUltimoProducto(telefono) {
 
 async function setUltimoProducto(telefono, producto) {
   await updateEstado(telefono, { ultimo_producto: producto });
+}
+
+// Guarda (compacto) los productos que se le acaban de mostrar al cliente, con marca de
+// tiempo, para poder resolver "esa / la segunda / la de $X" en el mensaje siguiente.
+async function setUltimosMostrados(telefono, productos) {
+  await updateEstado(telefono, { ultimos_mostrados: { ts: Date.now(), productos } });
+}
+
+// Devuelve la lista de productos recién mostrados si sigue vigente (maxMinutos), o null.
+async function getUltimosMostrados(telefono, maxMinutos = 15) {
+  const estado = await getEstado(telefono);
+  const v = estado.ultimos_mostrados;
+  if (!v?.ts || Date.now() - v.ts > maxMinutos * 60 * 1000) return null;
+  return Array.isArray(v.productos) ? v.productos : null;
 }
 
 // ─────────────────────────────────────────────
@@ -610,7 +655,8 @@ async function resetearEstadoSinPedido(telefono) {
     subtipo_pendiente: null,
     comparacion_pendiente: null,
     comparacion_productos: null,
-    transferencia_medida_pendiente: null
+    transferencia_medida_pendiente: null,
+    transferido_at: null
   });
 }
 
@@ -727,12 +773,16 @@ module.exports = {
   clearProductoPendiente,
   estaTransferida,
   marcarTransferida,
+  consumirReactivacionAsesor,
+  registrarEvento,
   haEnviadoSaludo,
   marcarSaludoEnviado,
   getCategoriaActual,
   setCategoriaActual,
   getUltimoProducto,
   setUltimoProducto,
+  setUltimosMostrados,
+  getUltimosMostrados,
   guardarPedido,
   getPedidos,
   limpiarConversaciones,
