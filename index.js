@@ -305,6 +305,42 @@ function normalizarTexto(texto) {
     .trim();
 }
 
+// Distancia de edición (Levenshtein) para tolerar erratas y variantes fonéticas al
+// buscar ("fiji" → "figy", "comedro" → "comedor"). Corte rápido si difieren mucho en
+// largo, para no gastar cómputo en pares que nunca van a coincidir.
+function distanciaEdicion(a, b) {
+  const m = a.length, n = b.length;
+  if (Math.abs(m - n) > 2) return 3;
+  let prev = Array.from({ length: n + 1 }, (_, j) => j);
+  for (let i = 1; i <= m; i++) {
+    const cur = [i];
+    for (let j = 1; j <= n; j++) {
+      const costo = a[i - 1] === b[j - 1] ? 0 : 1;
+      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + costo);
+    }
+    prev = cur;
+  }
+  return prev[n];
+}
+
+// ¿La palabra de la consulta "casa" con algún token del nombre del producto? Acepta:
+//  - subcadena exacta (comportamiento anterior),
+//  - misma palabra pegada o separada ("sofacama" ↔ "sofa cama"),
+//  - erratas/variantes fonéticas cercanas ("fiji" ↔ "figy"): mismo prefijo de 2 letras
+//    y a lo sumo 2 ediciones de diferencia (la guarda de prefijo evita falsos positivos).
+function tokenCoincide(p, tokensNombre, nombreCompacto) {
+  if (p.length < 3) return false;
+  if (nombreCompacto.includes(p)) return true;
+  for (const t of tokensNombre) {
+    if (t.length < 3) continue;
+    if (t.includes(p) || p.includes(t)) return true;
+    if (p.length >= 4 && t.length >= 4 &&
+        p.slice(0, 2) === t.slice(0, 2) &&
+        distanciaEdicion(p, t) <= 2) return true;
+  }
+  return false;
+}
+
 const UBICACIONES = {
   1: 'Avenida Bolívar # 16 N 26, Armenia, Quindío',
   2: 'Km 2 vía El Edén, Armenia, Quindío',
@@ -423,19 +459,16 @@ function buscarEnInventario(consulta, categoria, limite = 6) {
       const nombre = normalizarTexto(prod.nombre);
       const material = normalizarTexto(prod.material || '');
       const medidas = normalizarTexto(prod.medidas || '');
+      const tokensNombre = nombre.split(/\s+/).filter(Boolean);
+      const nombreCompacto = nombre.replace(/\s+/g, '');
       let score = 0;
       for (const p of palabras) {
         if (nombre.includes(p)) score += p.length * 2;
+        // Coincidencia difusa en el nombre (pegado/separado o errata): casi tanto peso
+        // como la exacta, para que "sofacama" o "fiji" encuentren su producto.
+        else if (tokenCoincide(p, tokensNombre, nombreCompacto)) score += p.length * 2 - 1;
         else if (material.includes(p)) score += p.length;
         else if (medidas.includes(p)) score += p.length;
-        // Fuzzy: acepta palabras similares con 1 carácter diferente
-        else if (p.length >= 5) {
-          for (const pn of nombre.split(/\s+/)) {
-            if (Math.abs(p.length - pn.length) <= 1 && pn.startsWith(p.substring(0, p.length - 1))) {
-              score += p.length;
-            }
-          }
-        }
       }
       // Empujones por nº de puestos y forma (comedores) — clave para "4 puestos",
       // "mesa redonda", "en forma de copa".
@@ -500,9 +533,12 @@ function buscarImagenProducto(nombreProducto) {
     for (const prod of (catData.productos || [])) {
       if (!prod.imagen) continue;
       const nombre = normalizarTexto(prod.nombre);
+      const tokensNombre = nombre.split(/\s+/).filter(Boolean);
+      const nombreCompacto = nombre.replace(/\s+/g, '');
       let score = 0;
       for (const p of palabras) {
-        if (nombre.includes(p)) score += p.length;
+        if (nombre.includes(p)) score += p.length * 2;
+        else if (tokenCoincide(p, tokensNombre, nombreCompacto)) score += p.length * 2 - 1;
       }
       if (score > mejorScore) { mejorScore = score; mejor = prod; }
     }
@@ -537,6 +573,7 @@ INSTRUCCIONES OBLIGATORIAS:
 1. SIEMPRE usa buscar_productos antes de mencionar cualquier producto o precio
 2. NUNCA inventes precios, nombres o disponibilidad — solo lo que veas en el inventario
 2b. Usa el NOMBRE EXACTO del producto tal como lo devuelve la herramienta, palabra por palabra. NO le agregues, quites ni cambies palabras: si el producto es "BASE FIGY RECTA" no digas "Mesa de barra Figy Recta" ni "Comedor Figy"; si es "BASE 2K" no lo llames de otra forma. El nombre real es el que devuelve la herramienta, y ese mismo nombre es el que debes usar en agregar_al_carrito y enviar_foto.
+2c. La búsqueda YA tolera nombres pegados y pequeñas erratas: si el cliente escribe "sofacama" encontrará "sofá cama", y si escribe "comedor fiji" encontrará "BASE FIGY". NUNCA le digas al cliente "no encontré una coincidencia exacta" ni le pidas permiso para mostrarle opciones: simplemente llama buscar_productos (con la categoría correcta si es evidente) y muéstrale directamente lo que devuelva. Solo si de verdad vuelve vacío ofrécele alternativas.
 3. Cuando el cliente mencione un presupuesto o diga "barato/económico" → usa buscar_por_presupuesto
 4. Cuando el cliente pregunte sobre disponibilidad ("¿tienes X?", "¿hay X?", "¿en qué tienda está?", "¿dónde lo puedo ver?") → responde siempre: "¡Seguramente sí! 😊 En DeCasa manejamos buen stock y lo que no tengamos en tienda lo fabricamos al mismo precio desde nuestro taller. ¿Quieres que te comunique con un asesor para confirmar disponibilidad y coordinar?" — luego espera su respuesta. Si el cliente dice que sí quiere confirmar → llama transferir_asesor. NUNCA menciones una tienda específica.
 4. Para ver carrito → llama ver_carrito
