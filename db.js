@@ -753,6 +753,45 @@ async function upsertHashProducto(nombre, imagenUrl, hash) {
 }
 
 // ─────────────────────────────────────────────
+// COLA DE NOTIFICACIONES PENDIENTES
+// ─────────────────────────────────────────────
+
+// Guarda una notificación al sistema de ventas que no se pudo entregar, para que el
+// worker la reintente. El primer reintento va con un minuto de retraso: si la API está
+// reiniciando, ya habrá vuelto.
+async function encolarNotificacion(telefono, tipo, payload, retrasoSegundos = 60) {
+  await pool.query(
+    `INSERT INTO wa_notificaciones_pendientes (telefono, tipo, payload, proximo_envio)
+     VALUES (?, ?, ?, DATE_ADD(NOW(), INTERVAL ? SECOND))`,
+    [telefono, tipo, JSON.stringify(payload), retrasoSegundos]
+  );
+}
+
+async function getNotificacionesPendientes(limite = 10) {
+  const [rows] = await pool.query(
+    `SELECT id, telefono, tipo, payload, intentos FROM wa_notificaciones_pendientes
+     WHERE proximo_envio <= NOW() ORDER BY proximo_envio ASC LIMIT ?`,
+    [limite]
+  );
+  return rows.map(r => ({ ...r, payload: typeof r.payload === 'string' ? JSON.parse(r.payload) : r.payload }));
+}
+
+async function eliminarNotificacion(id) {
+  await pool.query('DELETE FROM wa_notificaciones_pendientes WHERE id = ?', [id]);
+}
+
+// Backoff exponencial entre reintentos: 2, 4, 8, 16... minutos, con tope en 2 horas.
+async function reprogramarNotificacion(id, intentos, error) {
+  const minutos = Math.min(2 ** intentos, 120);
+  await pool.query(
+    `UPDATE wa_notificaciones_pendientes
+     SET intentos = ?, ultimo_error = ?, proximo_envio = DATE_ADD(NOW(), INTERVAL ? MINUTE)
+     WHERE id = ?`,
+    [intentos, String(error).substring(0, 500), minutos, id]
+  );
+}
+
+// ─────────────────────────────────────────────
 // EXPORTS
 // ─────────────────────────────────────────────
 
@@ -760,6 +799,10 @@ module.exports = {
   pool,
   getHashesProductos,
   upsertHashProducto,
+  encolarNotificacion,
+  getNotificacionesPendientes,
+  eliminarNotificacion,
+  reprogramarNotificacion,
   getOrCreateUsuario,
   getHistorial,
   addMensaje,

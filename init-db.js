@@ -215,6 +215,25 @@ async function initDB() {
     `);
     console.log('✅ Tabla wa_eventos creada o verificada');
 
+    // Cola durable de notificaciones al sistema de ventas. Si el POST a Redes falla
+    // (API caída, timeout), el pedido o la cita ya quedó en BD pero la tarjeta del
+    // asesor nunca existía y nadie la reintentaba: la solicitud se perdía en silencio
+    // y había que crearla a mano. Análoga a ig_notificaciones_pendientes.
+    await connection.query(`
+      CREATE TABLE IF NOT EXISTS wa_notificaciones_pendientes (
+        id            BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+        telefono      VARCHAR(50) NOT NULL,
+        tipo          VARCHAR(30) NOT NULL,
+        payload       JSON NOT NULL,
+        intentos      INT DEFAULT 0,
+        ultimo_error  TEXT,
+        proximo_envio DATETIME NOT NULL,
+        created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_proximo (proximo_envio)
+      )
+    `);
+    console.log('✅ Tabla wa_notificaciones_pendientes creada o verificada');
+
     console.log('\n🎉 Base de datos lista!\n');
     
   } catch (error) {
