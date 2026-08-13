@@ -46,8 +46,13 @@ const pool = mysql.createPool({
 // USUARIO
 // ─────────────────────────────────────────────
 
-async function getOrCreateUsuario(telefono) {
+// `nombre` es el ProfileName que manda Twilio en cada webhook: el nombre con el que el
+// cliente tiene configurado su WhatsApp. Antes se ignoraba y la columna quedaba vacía,
+// así que las tarjetas del panel de ventas llegaban con un número pelado en vez del
+// nombre de la persona.
+async function getOrCreateUsuario(telefono, nombre = null) {
   const telefonoLimpio = telefono.replace('whatsapp:', '');
+  const nombreLimpio = nombre?.trim() || null;
 
   const [usuarios] = await pool.query(
     'SELECT * FROM clientes_wa WHERE telefono = ?',
@@ -56,15 +61,24 @@ async function getOrCreateUsuario(telefono) {
 
   let usuario;
   if (usuarios.length > 0) {
-    await pool.query(
-      'UPDATE clientes_wa SET last_interaction = NOW() WHERE id = ?',
-      [usuarios[0].id]
-    );
+    // El nombre se refresca si cambió (el cliente puede editarlo en su WhatsApp).
+    if (nombreLimpio && nombreLimpio !== usuarios[0].nombre) {
+      await pool.query(
+        'UPDATE clientes_wa SET nombre = ?, last_interaction = NOW() WHERE id = ?',
+        [nombreLimpio, usuarios[0].id]
+      );
+      usuarios[0].nombre = nombreLimpio;
+    } else {
+      await pool.query(
+        'UPDATE clientes_wa SET last_interaction = NOW() WHERE id = ?',
+        [usuarios[0].id]
+      );
+    }
     usuario = usuarios[0];
   } else {
     const [result] = await pool.query(
-      'INSERT INTO clientes_wa (telefono, created_at, last_interaction) VALUES (?, NOW(), NOW())',
-      [telefonoLimpio]
+      'INSERT INTO clientes_wa (telefono, nombre, created_at, last_interaction) VALUES (?, ?, NOW(), NOW())',
+      [telefonoLimpio, nombreLimpio]
     );
     const [nuevoUsuario] = await pool.query(
       'SELECT * FROM clientes_wa WHERE id = ?',
@@ -752,6 +766,20 @@ async function upsertHashProducto(nombre, imagenUrl, hash) {
   );
 }
 
+// Nombre con el que el cliente tiene configurado su WhatsApp, para que las
+// notificaciones al panel de ventas no lleguen solo con el número.
+async function getNombreCliente(telefono) {
+  try {
+    const [rows] = await pool.query(
+      'SELECT nombre FROM clientes_wa WHERE telefono = ?',
+      [telefono.replace('whatsapp:', '')]
+    );
+    return rows[0]?.nombre || null;
+  } catch {
+    return null;
+  }
+}
+
 // ─────────────────────────────────────────────
 // COLA DE NOTIFICACIONES PENDIENTES
 // ─────────────────────────────────────────────
@@ -799,6 +827,7 @@ module.exports = {
   pool,
   getHashesProductos,
   upsertHashProducto,
+  getNombreCliente,
   encolarNotificacion,
   getNotificacionesPendientes,
   eliminarNotificacion,

@@ -280,14 +280,15 @@ function encolar(telefono, tarea) {
 
 // Punto de entrada desde el webhook. Acumula lo que llegue dentro de la ventana y lo
 // procesa una sola vez.
-function recibirMensaje({ from, toNumber, texto, mediaUrl, mediaType }) {
+function recibirMensaje({ from, toNumber, texto, mediaUrl, mediaType, profileName }) {
   let buf = _buffers.get(from);
   if (!buf) {
-    buf = { textos: [], media: null, toNumber, timer: null };
+    buf = { textos: [], media: null, toNumber, profileName: null, timer: null };
     _buffers.set(from, buf);
   }
 
   if (toNumber) buf.toNumber = toNumber;
+  if (profileName) buf.profileName = profileName;
   if (texto) buf.textos.push(texto);
   // Si en la misma ráfaga llegan varios adjuntos se conserva el último; lo normal es
   // uno solo por turno, y el texto que lo acompaña sí se acumula entero.
@@ -302,6 +303,7 @@ function recibirMensaje({ from, toNumber, texto, mediaUrl, mediaType }) {
       incomingMsg: buf.textos.join('\n'),
       mediaUrl:    buf.media?.mediaUrl ?? null,
       mediaType:   buf.media?.mediaType ?? null,
+      profileName: buf.profileName,
     }).catch(e => {
       console.error('[ERROR] procesarMensaje:', e.message, e.stack?.split('\n')[1]);
       alertar('procesarMensaje falló', `${from} — ${e.message}`);
@@ -421,7 +423,9 @@ async function enviarNotificacionTelegram(telefono, mensaje, historial, tipo = '
   }
 
   const telefonoLimpio = telefono.replace(/\D/g, '');
-  const nombreCliente  = extra.nombre || null;
+  // El nombre que dio el cliente al agendar manda; si no hay, se usa el de su perfil de
+  // WhatsApp (ProfileName), para que el asesor no reciba solo un número.
+  const nombreCliente  = extra.nombre || await db.getNombreCliente(telefono);
   const whatsappUrl    = `https://wa.me/${telefonoLimpio}`;
 
   const titulos = {
@@ -1777,6 +1781,10 @@ app.post('/webhook', (req, res) => {
   const mediaUrl = req.body.MediaUrl0;
   const mediaType = req.body.MediaContentType0;
   const messageSid = req.body.MessageSid || req.body.SmsSid || '';
+  // Nombre con el que el cliente tiene configurado su WhatsApp. Twilio lo manda en cada
+  // webhook y antes se descartaba, así que el asesor recibía la solicitud con el número
+  // pelado aunque el nombre viniera gratis.
+  const profileName = (req.body.ProfileName || '').trim();
 
   res.status(200).send('');
 
@@ -1790,14 +1798,14 @@ app.post('/webhook', (req, res) => {
     return;
   }
 
-  recibirMensaje({ from, toNumber, texto: incomingMsg, mediaUrl, mediaType });
+  recibirMensaje({ from, toNumber, texto: incomingMsg, mediaUrl, mediaType, profileName });
 });
 
 // Procesa un turno completo del cliente (ya agrupado por el buffer de ráfagas).
-async function procesarMensaje({ from, toNumber, incomingMsg, mediaUrl, mediaType }) {
+async function procesarMensaje({ from, toNumber, incomingMsg, mediaUrl, mediaType, profileName }) {
   try {
     await db.verificarYLimpiarInactividad(from);
-    await db.getOrCreateUsuario(from);
+    await db.getOrCreateUsuario(from, profileName);
 
     // Métrica: una conversación nueva empieza cuando no hay historial previo (tras el
     // posible limpiado por inactividad de arriba). Fire-and-forget, no bloquea el flujo.
@@ -2056,8 +2064,23 @@ app.get('/admin/resumen', async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 
+// Aviso al arrancar si el token con el que el agente se identifica ante el sistema de
+// ventas sigue siendo uno de los valores por defecto: cualquiera que lo adivine podría
+// inyectar pedidos y citas falsos en el panel.
+function revisarSeguridad() {
+  const t = process.env.DECASA_AGENT_TOKEN;
+  const debiles = ['', 'decasa_agent_2026', 'changeme', 'token', 'secret'];
+  if (!t || debiles.includes(t)) {
+    console.warn('[seguridad] ⚠️ DECASA_AGENT_TOKEN ausente o débil. Rótalo por un valor largo y aleatorio.');
+  }
+  if (!process.env.TWILIO_AUTH_TOKEN) {
+    console.warn('[seguridad] ⚠️ TWILIO_AUTH_TOKEN ausente: la validación de firma del webhook queda desactivada.');
+  }
+}
+
 async function startServer() {
   console.log('[SERVER] 🔵 Iniciando Elena - DeCasa...');
+  revisarSeguridad();
   try {
     await initDB();
     console.log('[SERVER] ✅ Base de datos conectada');
