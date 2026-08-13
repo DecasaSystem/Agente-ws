@@ -80,6 +80,13 @@ function recalcularPreciosInventario() {
     for (const p of cat.productos || []) {
       const n = Number(p.precio ?? 0);
       if (n) set.add(n);
+      // Los precios de las variantes también son válidos: sin esto, en cuanto Elena
+      // diera el precio correcto de una medida concreta saltaría la alerta de precio
+      // inventado, porque ese importe no existe como precio_base de ningún producto.
+      for (const v of p.variantes || []) {
+        const nv = Number(v.precio ?? 0);
+        if (nv) set.add(nv);
+      }
     }
   }
   preciosInventario = set;
@@ -580,6 +587,58 @@ async function enviarMensajeAdicional(from, toNumber, body, mediaUrl) {
   }
 }
 
+// ─── VARIANTES DE PRECIO ──────────────────────────────────────────────────────
+
+// Traduce las variantes de un producto a los campos que ve el modelo. La regla clave:
+// si las opciones tienen precios distintos, NO se le entrega un `precio` suelto — se le
+// da el rango y la lista, para que no pueda comprometer un importe que solo vale para
+// una de las medidas. Si todas cuestan igual (color, acabado), el precio es único y las
+// opciones son solo información que enriquece la respuesta.
+function infoPrecioVariantes(p) {
+  const variantes = (p.variantes || []).filter(v => v.etiqueta && v.precio > 0);
+  if (variantes.length === 0) return { precio: p.precio };
+
+  const precios = [...new Set(variantes.map(v => v.precio))];
+  const opciones = variantes.map(v => ({ opcion: v.etiqueta, precio: v.precio }));
+
+  if (precios.length === 1) {
+    return {
+      precio: p.precio,
+      opciones: variantes.map(v => v.etiqueta),
+      tipo_opcion: variantes[0].tipo,
+    };
+  }
+
+  return {
+    precio: null,
+    precio_desde: Math.min(...precios),
+    precio_hasta: Math.max(...precios),
+    tipo_variante: variantes[0].tipo,
+    variantes: opciones,
+    nota_variantes: 'Este producto tiene varias opciones con PRECIOS DISTINTOS. No des un precio único ni menciones solo el más bajo como si fuera el precio: dile el rango (desde X hasta Y), enumera las opciones disponibles y pregúntale cuál necesita. Cuando la elija, dale el precio exacto de ESA opción.',
+  };
+}
+
+// Precio con el que comparar contra el presupuesto del cliente: el más bajo al que
+// puede llevarse el producto.
+function precioMinimo(p) {
+  const variantes = (p.variantes || []).filter(v => v.precio > 0);
+  if (!variantes.length) return parsearPrecio(p.precio);
+  return Math.min(...variantes.map(v => v.precio));
+}
+
+// Busca una variante por lo que escribió el cliente ("1.60", "6 pts", "flor morado").
+// Tolerante con la puntuación porque en la BD conviven "1,40", "1.40" y "160".
+function encontrarVariante(producto, textoVariante) {
+  const variantes = (producto?.variantes || []).filter(v => v.etiqueta && v.precio > 0);
+  if (!variantes.length || !textoVariante) return null;
+  const norm = s => normalizarTexto(String(s)).replace(/[.,\s]/g, '');
+  const buscado = norm(textoVariante);
+  return variantes.find(v => norm(v.etiqueta) === buscado)
+      ?? variantes.find(v => norm(v.etiqueta).includes(buscado) || buscado.includes(norm(v.etiqueta)))
+      ?? null;
+}
+
 // ─── BÚSQUEDA EN INVENTARIO ───────────────────────────────────────────────────
 
 // El cliente pide "4 puestos/personas" y en el catálogo eso vive en medidas como
@@ -636,6 +695,7 @@ function buscarEnInventario(consulta, categoria, limite = 6) {
           nombre: prod.nombre, precio: prod.precio,
           material: prod.material || null, medidas: prod.medidas || null,
           tieneImagen: !!prod.imagen, imagen: prod.imagen || null, imagen2: prod.imagen2 || null,
+          variantes: prod.variantes || [],
           categoria: catKey, categoriaNombre: catData.nombre, score
         });
       }
@@ -648,6 +708,7 @@ function buscarEnInventario(consulta, categoria, limite = 6) {
       nombre: p.nombre, precio: p.precio,
       material: p.material || null, medidas: p.medidas || null,
       tieneImagen: !!p.imagen, imagen: p.imagen || null, imagen2: p.imagen2 || null,
+      variantes: p.variantes || [],
       categoria, categoriaNombre: inventario[categoria].nombre, score: 0
     }));
   }
@@ -664,12 +725,15 @@ function buscarEnInventarioPorPresupuesto(presupuestoMax, categoria, limite = 5)
   for (const [catKey, catData] of Object.entries(cats)) {
     if (!catData?.productos) continue;
     for (const prod of catData.productos) {
-      const precio = parsearPrecio(prod.precio);
+      // Con variantes cuenta el precio de entrada: si el cliente tiene $3.000.000 y la
+      // cama en 1.40 vale $2.980.000, el producto entra aunque la de 2 metros se pase.
+      const precio = precioMinimo(prod);
       if (precio > 0 && precio <= presupuestoMax) {
         resultados.push({
           nombre: prod.nombre, precio: prod.precio, precioNumerico: precio,
           material: prod.material || null, medidas: prod.medidas || null,
           tieneImagen: !!prod.imagen, imagen: prod.imagen || null, imagen2: prod.imagen2 || null,
+          variantes: prod.variantes || [],
           categoria: catKey, categoriaNombre: catData.nombre
         });
       }
@@ -742,6 +806,17 @@ INSTRUCCIONES OBLIGATORIAS:
 10. Si quiere vaciar todo el carrito → llama quitar_del_carrito sin el campo producto
 11. Para finalizar la compra → llama confirmar_pedido (solo cuando el cliente confirme explícitamente)
 NUNCA llames transferir_asesor cuando el cliente quiera comprar — usa siempre el flujo de carrito
+
+VARIANTES: PRODUCTOS CON VARIOS PRECIOS — REGLA ABSOLUTA:
+Muchos productos se venden en varias medidas, materiales o acabados, y CADA OPCIÓN VALE DISTINTO. Cuando buscar_productos devuelva un producto con "precio_desde", "precio_hasta" y "variantes", ese producto NO tiene un precio único:
+- NUNCA des un solo precio, ni digas "cuesta $X", ni uses el más barato como si fuera el precio. Prometer un precio que no aplica a la medida que quiere el cliente es un error grave.
+- Preséntalo así: el rango ("desde $X hasta $Y"), las opciones disponibles y una pregunta para que elija. Ejemplo:
+  "*CAMA MIAMI* — desde $2.480.000 hasta $2.980.000 😊
+  Viene en 1.90 y 1.60, y el precio cambia según la medida.
+  ¿Para qué medida la necesitas? Así te digo el precio exacto"
+- Cuando el cliente elija una opción, dale el precio EXACTO de esa opción (el que aparece en la lista de variantes, textualmente).
+- Para agregarlo al carrito DEBES pasar el campo 'variante' con la opción que eligió. Si aún no la eligió, pregúntale primero: la herramienta te va a rechazar la llamada sin ese dato.
+- Si el producto trae "opciones" pero un solo precio (p.ej. colores), el precio es único: menciona las opciones como algo positivo, sin hablar de rangos.
 
 DISPONIBILIDAD EN TIENDAS — REGLA ABSOLUTA:
 - NUNCA digas en qué tienda específica está un producto — no tienes esa información en tiempo real
@@ -931,6 +1006,7 @@ const TOOLS = [
         properties: {
           producto: { type: 'string', description: 'Nombre exacto del producto tal como aparece en el inventario' },
           precio: { type: 'string', description: 'Precio del producto tal como aparece en el inventario (ej: "$1.200.000")' },
+          variante: { type: 'string', description: 'Opción elegida por el cliente cuando el producto tiene variantes con precios distintos (ej: "1.60", "6 pts", "piedra sinterizada"). Obligatorio en esos productos: sin ella no se puede saber el precio.' },
           cantidad: { type: 'number', description: 'Cantidad a agregar (default: 1)' }
         },
         required: ['producto', 'precio']
@@ -1086,8 +1162,11 @@ function evento(telefono, tipo, detalle) {
 // flujo si falla.
 async function recordarMostrados(from, productos) {
   try {
+    // Con variantes se guarda el precio de entrada: "la de $X" del cliente se resuelve
+    // por el precio más bajo, que es el que se le mostró como "desde".
     await db.setUltimosMostrados(from, productos.slice(0, 6).map(p => ({
-      nombre: p.nombre, precio: p.precio
+      nombre: p.nombre,
+      precio: (p.variantes?.length ? formatearMoneda(precioMinimo(p)) : p.precio)
     })));
   } catch (e) { console.warn('[mostrados] no se pudo guardar:', e.message); }
 }
@@ -1129,7 +1208,8 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
       return {
         encontrados: resultados.length,
         productos: resultados.map(p => ({
-          nombre: p.nombre, precio: p.precio,
+          nombre: p.nombre,
+          ...infoPrecioVariantes(p),
           material: p.material, medidas: p.medidas,
           foto_disponible: p.tieneImagen, categoria: p.categoriaNombre
         }))
@@ -1159,7 +1239,8 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
         encontrados: resultados.length,
         presupuesto: formatearMoneda(presupuesto),
         productos: resultados.map(p => ({
-          nombre: p.nombre, precio: p.precio,
+          nombre: p.nombre,
+          ...infoPrecioVariantes(p),
           material: p.material, medidas: p.medidas,
           foto_disponible: p.tieneImagen, categoria: p.categoriaNombre
         }))
@@ -1214,29 +1295,57 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
     }
 
     case 'agregar_al_carrito': {
-      const { producto, precio, cantidad = 1 } = args;
+      const { producto, cantidad = 1 } = args;
+      let { precio } = args;
+
+      // Un producto con variantes de precio no puede entrar al carrito "a secas": el
+      // pedido llegaría al sistema de ventas con un importe que no corresponde a lo que
+      // el cliente quiere. Se exige la opción y el precio sale de la BD, no del modelo.
+      const prodInventario = buscarEnInventario(producto, null, 1)[0];
+      const variantesPrecio = (prodInventario?.variantes || []).filter(v => v.etiqueta && v.precio > 0);
+      const preciosDistintos = new Set(variantesPrecio.map(v => v.precio)).size > 1;
+
+      let etiquetaVariante = null;
+      if (preciosDistintos) {
+        const elegida = encontrarVariante(prodInventario, args.variante);
+        if (!elegida) {
+          return {
+            exito: false,
+            requiere_variante: true,
+            opciones: variantesPrecio.map(v => ({ opcion: v.etiqueta, precio: formatearMoneda(v.precio) })),
+            error: `"${producto}" se vende en varias opciones con precios distintos. Pregúntale al cliente cuál quiere (enumerándole las opciones con su precio) y vuelve a llamar agregar_al_carrito con el campo variante. NO lo agregues ni le des un precio hasta que elija.`
+          };
+        }
+        etiquetaVariante = elegida.etiqueta;
+        precio = formatearMoneda(elegida.precio); // el precio manda desde la BD
+      }
+
+      const nombreCarrito = etiquetaVariante ? `${producto} (${etiquetaVariante})` : producto;
+
       const items = await db.verCarrito(from);
       if (items.length >= 10) {
         return { exito: false, error: 'El carrito está lleno (máximo 10 productos). Confirma la compra o elimina algo primero.' };
       }
-      const existe = items.find(i => i.producto.toLowerCase() === producto.toLowerCase());
+      const existe = items.find(i => i.producto.toLowerCase() === nombreCarrito.toLowerCase());
       if (existe) {
         const nuevaCantidad = Number(cantidad) || existe.cantidad || 1;
         existe.cantidad = nuevaCantidad;
         await db.updateEstado(from, { carrito: items });
         const total = items.reduce((s, i) => s + parsearPrecio(i.precio) * (i.cantidad || 1), 0);
         return {
-          exito: true, mensaje: `Cantidad de "${producto}" actualizada a ${nuevaCantidad} unidad${nuevaCantidad > 1 ? 'es' : ''}.`,
+          exito: true, mensaje: `Cantidad de "${nombreCarrito}" actualizada a ${nuevaCantidad} unidad${nuevaCantidad > 1 ? 'es' : ''}.`,
           items_en_carrito: items.length, total_carrito: formatearMoneda(total)
         };
       }
-      // Guardar también como último producto visto
+      // Guardar también como último producto visto (con el nombre real del catálogo,
+      // sin la variante, para que enviar_foto siga encontrando su imagen)
       await db.setUltimoProducto(from, { nombre: producto, precio, ts: Date.now() });
-      await db.agregarAlCarrito(from, producto, precio, Number(cantidad) || 1);
+      await db.agregarAlCarrito(from, nombreCarrito, precio, Number(cantidad) || 1);
       const itemsActualizados = await db.verCarrito(from);
       const total = itemsActualizados.reduce((s, i) => s + parsearPrecio(i.precio) * (i.cantidad || 1), 0);
       return {
-        exito: true, mensaje: `${producto} agregado al carrito.`,
+        exito: true, mensaje: `${nombreCarrito} agregado al carrito por ${precio}.`,
+        variante: etiquetaVariante,
         items_en_carrito: itemsActualizados.length, total_carrito: formatearMoneda(total)
       };
     }
@@ -2004,4 +2113,6 @@ module.exports = {
   app, startServer, extraerPrecios, validarPrecios, setPreciosInventarioParaPruebas,
   // Expuestos para pruebas del buffer de ráfagas y del troceo de mensajes largos.
   recibirMensaje, procesarMensaje, encolar, trocearTexto, DEBOUNCE_MS,
+  // Expuestos para pruebas de variantes de precio.
+  cargarInventario, infoPrecioVariantes, precioMinimo, encontrarVariante, recalcularPreciosInventario,
 };
