@@ -249,3 +249,40 @@ describe('Escalado cuando el agente falla', () => {
     expect(respuesta).toContain('Un asesor te contactará pronto');
   });
 });
+
+describe('Nombre del cliente (ProfileName de Twilio)', () => {
+  test('se guarda al crear o actualizar el cliente', async () => {
+    const from = 'whatsapp:+573009990000';
+    recibirMensaje({ from, toNumber: TO, texto: 'hola', profileName: 'Ana María' });
+    await correrTurno();
+
+    expect(db.getOrCreateUsuario).toHaveBeenCalledWith(from, 'Ana María');
+  });
+
+  test('la notificacion al panel lleva el nombre, no solo el numero', async () => {
+    db.getNombreCliente.mockResolvedValue('Ana María');
+    mockOpenAICreate
+      .mockResolvedValueOnce(respuestaConTool('transferir_asesor', { razon: 'Quiere ver la cama Lisboa' }))
+      .mockResolvedValue(respuestaSimple('Un asesor te escribe 😊'));
+
+    recibirMensaje({ from: 'whatsapp:+573009990000', toNumber: TO, texto: 'un asesor por favor', profileName: 'Ana María' });
+    await correrTurno();
+
+    const cuerpo = JSON.parse(mockFetchWithRetry.mock.calls[0][1].body);
+    expect(cuerpo.nombre_cliente).toBe('Ana María');
+  });
+
+  test('sin ProfileName la notificacion sigue saliendo', async () => {
+    db.getNombreCliente.mockResolvedValue(null);
+    mockOpenAICreate
+      .mockResolvedValueOnce(respuestaConTool('transferir_asesor', { razon: 'Pregunta por garantia' }))
+      .mockResolvedValue(respuestaSimple('Listo 😊'));
+
+    recibirMensaje({ from: 'whatsapp:+573001112222', toNumber: TO, texto: 'asesor' });
+    await correrTurno();
+
+    const cuerpo = JSON.parse(mockFetchWithRetry.mock.calls[0][1].body);
+    expect(cuerpo.nombre_cliente).toBeNull();
+    expect(cuerpo.tipo).toBe('asesor');
+  });
+});

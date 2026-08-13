@@ -46,8 +46,13 @@ const pool = mysql.createPool({
 // USUARIO
 // ─────────────────────────────────────────────
 
-async function getOrCreateUsuario(telefono) {
+// `nombre` es el ProfileName que manda Twilio en cada webhook: el nombre con el que el
+// cliente tiene configurado su WhatsApp. Antes se ignoraba y la columna quedaba vacía,
+// así que las tarjetas del panel de ventas llegaban con un número pelado en vez del
+// nombre de la persona.
+async function getOrCreateUsuario(telefono, nombre = null) {
   const telefonoLimpio = telefono.replace('whatsapp:', '');
+  const nombreLimpio = nombre?.trim() || null;
 
   const [usuarios] = await pool.query(
     'SELECT * FROM clientes_wa WHERE telefono = ?',
@@ -56,15 +61,24 @@ async function getOrCreateUsuario(telefono) {
 
   let usuario;
   if (usuarios.length > 0) {
-    await pool.query(
-      'UPDATE clientes_wa SET last_interaction = NOW() WHERE id = ?',
-      [usuarios[0].id]
-    );
+    // El nombre se refresca si cambió (el cliente puede editarlo en su WhatsApp).
+    if (nombreLimpio && nombreLimpio !== usuarios[0].nombre) {
+      await pool.query(
+        'UPDATE clientes_wa SET nombre = ?, last_interaction = NOW() WHERE id = ?',
+        [nombreLimpio, usuarios[0].id]
+      );
+      usuarios[0].nombre = nombreLimpio;
+    } else {
+      await pool.query(
+        'UPDATE clientes_wa SET last_interaction = NOW() WHERE id = ?',
+        [usuarios[0].id]
+      );
+    }
     usuario = usuarios[0];
   } else {
     const [result] = await pool.query(
-      'INSERT INTO clientes_wa (telefono, created_at, last_interaction) VALUES (?, NOW(), NOW())',
-      [telefonoLimpio]
+      'INSERT INTO clientes_wa (telefono, nombre, created_at, last_interaction) VALUES (?, ?, NOW(), NOW())',
+      [telefonoLimpio, nombreLimpio]
     );
     const [nuevoUsuario] = await pool.query(
       'SELECT * FROM clientes_wa WHERE id = ?',
@@ -752,6 +766,20 @@ async function upsertHashProducto(nombre, imagenUrl, hash) {
   );
 }
 
+// Nombre con el que el cliente tiene configurado su WhatsApp, para que las
+// notificaciones al panel de ventas no lleguen solo con el número.
+async function getNombreCliente(telefono) {
+  try {
+    const [rows] = await pool.query(
+      'SELECT nombre FROM clientes_wa WHERE telefono = ?',
+      [telefono.replace('whatsapp:', '')]
+    );
+    return rows[0]?.nombre || null;
+  } catch {
+    return null;
+  }
+}
+
 // ─────────────────────────────────────────────
 // COLA DE NOTIFICACIONES PENDIENTES
 // ─────────────────────────────────────────────
@@ -799,6 +827,7 @@ module.exports = {
   pool,
   getHashesProductos,
   upsertHashProducto,
+  getNombreCliente,
   encolarNotificacion,
   getNotificacionesPendientes,
   eliminarNotificacion,
@@ -915,7 +944,8 @@ async function getInventarioFromDB() {
   try {
     // Esquema Laravel: precio_base, foto_url, categoria
     [rows] = await pool.query(
-      `SELECT nombre,
+      `SELECT id,
+              nombre,
               precio_base AS precio,
               foto_url    AS imagen,
               foto_url_2  AS imagen2,
@@ -935,6 +965,8 @@ async function getInventarioFromDB() {
     );
   }
 
+  const variantesPorProducto = await getVariantesPorProducto();
+
   const inventario = {};
   for (const row of rows) {
     const key = SUBCATEGORIA_KEY_MAP[row.subcategoria] || row.subcategoria;
@@ -946,8 +978,81 @@ async function getInventarioFromDB() {
       medidas:  row.medidas || '',
       material: row.material || '',
       precio:   formatearPrecioFromDB(row.precio),
-      imagen:   row.imagen || ''
+      imagen:   row.imagen || '',
+      variantes: variantesPorProducto.get(row.id) ?? []
     });
   }
   return inventario;
+}
+
+// ─────────────────────────────────────────────
+// VARIANTES DE PRODUCTO
+// ─────────────────────────────────────────────
+
+// Un mismo producto puede venderse en varias medidas/acabados con PRECIOS DISTINTOS.
+// Sin esto los agentes cotizaban siempre el precio_base: para el COLCHON SOPHIA decían
+// $760.000 cuando la medida de 1.40 vale $960.000, comprometiendo un precio por debajo
+// del real, y para la CAMA CHOCOLATINA cotizaban $500.000 de más.
+//
+// Hay dos mecanismos en la base de datos, sin solaparse entre sí:
+//
+//   1. producto_variante_configs — el actual (45 productos). Enlaza producto con un
+//      tipo de variante ("Cama Miami medidas", "Puestos") y sus opciones ("1.60",
+//      "4 pts"). OJO con el nombre de la columna: `precio_adicional` NO es un
+//      incremento sobre el precio base, es el PRECIO ABSOLUTO de esa variante; cuando
+//      vale 0 se usa el precio_base. Así lo calcula el sistema de ventas en
+//      NuevaOrdenView.vue (`precioAdicional > 0 ? precioAdicional : precio_base`), y
+//      por eso hay opciones más baratas que el precio base.
+//
+//   2. producto_variantes — la tabla anterior (solo los 3 colchones para precios), con
+//      la medida y su precio absoluto en `precio_variante`. Esa misma tabla guarda
+//      además variantes de TELA sin precio (marca/color), que aquí se ignoran porque
+//      no cambian cuánto cuesta el producto.
+//
+// `afecta_precio = 0` marca variantes cosméticas (p.ej. color del mantel): son opciones
+// reales que conviene ofrecer, pero todas cuestan lo mismo.
+async function getVariantesPorProducto() {
+  const mapa = new Map();
+  try {
+    const [rows] = await pool.query(`
+      SELECT cfg.producto_id                                   AS producto_id,
+             o.nombre                                          AS etiqueta,
+             CASE WHEN cfg.precio_adicional > 0
+                  THEN cfg.precio_adicional
+                  ELSE p.precio_base END                       AS precio,
+             tv.nombre                                         AS tipo,
+             tv.afecta_precio                                  AS afecta_precio
+      FROM producto_variante_configs cfg
+      JOIN productos p              ON p.id  = cfg.producto_id AND p.activo = 1
+      JOIN tipos_variante tv        ON tv.id = cfg.tipo_variante_id AND tv.activo = 1
+      JOIN tipo_variante_opciones o ON o.id  = cfg.opcion_id   AND o.activo = 1
+
+      UNION ALL
+
+      SELECT v.producto_id, v.medida, v.precio_variante, 'Medidas', 1
+      FROM producto_variantes v
+      JOIN productos p ON p.id = v.producto_id AND p.activo = 1
+      WHERE v.activo = 1
+        AND v.precio_variante IS NOT NULL
+        AND v.medida IS NOT NULL
+    `);
+
+    for (const r of rows) {
+      if (!mapa.has(r.producto_id)) mapa.set(r.producto_id, []);
+      mapa.get(r.producto_id).push({
+        etiqueta: String(r.etiqueta ?? '').trim(),
+        precio:   Number(r.precio ?? 0),
+        tipo:     r.tipo ?? 'Opciones',
+        afectaPrecio: Number(r.afecta_precio ?? 0) === 1,
+      });
+    }
+
+    // De menor a mayor precio: al cliente se le muestra "desde X" y así la lista queda
+    // en el orden en que la va a leer.
+    for (const lista of mapa.values()) lista.sort((a, b) => a.precio - b.precio);
+  } catch (e) {
+    // Si las tablas de variantes no existen (BD antigua), se sigue con precio único.
+    console.warn('[VARIANTES] no se pudieron cargar:', e.message);
+  }
+  return mapa;
 }
