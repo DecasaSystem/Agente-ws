@@ -761,14 +761,39 @@ function buscarImagenProducto(nombreProducto) {
       const tokensNombre = nombre.split(/\s+/).filter(Boolean);
       const nombreCompacto = nombre.replace(/\s+/g, '');
       let score = 0;
+      // El nombre exacto manda sobre cualquier parecido. Sin esto, "SOFA TORELLO" y
+      // "SOFA CAMA TORELLO DOS PUESTOS" empataban (ambos contienen las dos palabras
+      // pedidas) y ganaba el que saliera antes al recorrer el inventario: pedir la foto
+      // del SOFA TORELLO mandaba la del sofá cama. Afectaba a 11 productos reales.
+      if (nombre === q) score += 1000;
       for (const p of palabras) {
         if (nombre.includes(p)) score += p.length * 2;
         else if (tokenCoincide(p, tokensNombre, nombreCompacto)) score += p.length * 2 - 1;
       }
-      if (score > mejorScore) { mejorScore = score; mejor = prod; }
+      // A igualdad de puntos gana el nombre más corto: es el que añade menos palabras
+      // que el cliente no pidió.
+      if (score > mejorScore || (score === mejorScore && score > 0 && mejor && nombre.length < normalizarTexto(mejor.nombre).length)) {
+        mejorScore = score; mejor = prod;
+      }
     }
   }
-  return mejorScore > 0 ? { nombre: mejor.nombre, imagen: mejor.imagen, imagen2: mejor.imagen2 || null } : null;
+  if (!mejor) return null;
+
+  // Que haya "algo de parecido" no basta para mandarle una foto al cliente: con el
+  // score suelto, pedir "nevera" enviaba la foto de una LAMPARA DE MESA NEGRA y
+  // "televisor" la de una SILLA AUX ELE. Se exige que lo pedido esté de verdad en el
+  // nombre del producto (tolerando nombres pegados, pero no erratas: "nevera" está a
+  // dos letras de "negra"). Las erratas de quien escribe las absorbe buscar_productos,
+  // que es donde un resultado aproximado sí tiene sentido.
+  const nombreMejor   = normalizarTexto(mejor.nombre);
+  const compactoMejor = nombreMejor.replace(/\s+/g, '');
+  const significativas = palabras.filter(p => p.length >= 3);
+  if (significativas.length) {
+    const cubiertas = significativas.filter(p => nombreMejor.includes(p) || compactoMejor.includes(p)).length;
+    if (cubiertas / significativas.length < 0.6) return null;
+  }
+
+  return { nombre: mejor.nombre, imagen: mejor.imagen, imagen2: mejor.imagen2 || null };
 }
 
 // ─── SYSTEM PROMPT ───────────────────────────────────────────────────────────
@@ -1406,9 +1431,14 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
       const { nombre_producto } = args;
       const resultado = buscarImagenProducto(nombre_producto);
       if (!resultado) {
+        // Antes se enviaba el producto más parecido aunque no tuviera nada que ver.
+        // Ahora se admite que no está y se ofrecen alternativas para que Elena pregunte.
+        const cercanos = buscarEnInventario(nombre_producto, null, 3).map(p => p.nombre);
         return {
           exito: false,
-          error: `No encontré imagen para "${nombre_producto}". Ese producto puede no tener foto disponible.`
+          error: cercanos.length
+            ? `No tenemos "${nombre_producto}" en el catálogo. NO le mandes otra foto como si fuera ese producto. Lo más parecido es: ${cercanos.join(', ')}. Pregúntale al cliente si alguno le sirve.`
+            : `No tenemos "${nombre_producto}" en el catálogo. Díselo con amabilidad y pregúntale qué tipo de mueble busca.`
         };
       }
       // Actualizar último producto visto (imagen incluida para visualización)
@@ -2138,4 +2168,5 @@ module.exports = {
   recibirMensaje, procesarMensaje, encolar, trocearTexto, DEBOUNCE_MS,
   // Expuestos para pruebas de variantes de precio.
   cargarInventario, infoPrecioVariantes, precioMinimo, encontrarVariante, recalcularPreciosInventario,
+  buscarImagenProducto, buscarEnInventario,
 };
