@@ -5,7 +5,9 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm ci --only=production
 
-COPY index.js ./
+# Todo el código del agente (antes solo se copiaba index.js y knowledge.json, y el
+# contenedor moría en el primer require de db.js).
+COPY *.js ./
 COPY knowledge.json ./
 
 ENV PORT=3000

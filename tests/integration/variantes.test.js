@@ -225,6 +225,92 @@ describe('agregar_al_carrito con variantes', () => {
     expect(resultadoDeHerramienta().exito).toBe(true);
     expect(db.agregarAlCarrito).toHaveBeenCalledWith('whatsapp:+573004', 'CAMA SENCILLA', '$1.200.000', 1);
   });
+
+  test('sin variantes, el precio sale de la BD aunque el modelo pase otro', async () => {
+    mockOpenAICreate
+      .mockResolvedValueOnce(respuestaConTool('agregar_al_carrito', { producto: 'cama sencilla', precio: '$900.000' }))
+      .mockResolvedValue(respuestaFinal);
+
+    recibirMensaje({ from: 'whatsapp:+573006', toNumber: 'whatsapp:+15550001', texto: 'dámela en 900' });
+    await correrTurno();
+
+    expect(resultadoDeHerramienta().exito).toBe(true);
+    // Nombre real del catálogo y precio real, no lo que dijo el modelo
+    expect(db.agregarAlCarrito).toHaveBeenCalledWith('whatsapp:+573006', 'CAMA SENCILLA', '$1.200.000', 1);
+  });
+
+  test('un producto que no existe en el catálogo no entra al carrito', async () => {
+    mockOpenAICreate
+      .mockResolvedValueOnce(respuestaConTool('agregar_al_carrito', { producto: 'NEVERA SAMSUNG', precio: '$2.000.000' }))
+      .mockResolvedValue(respuestaFinal);
+
+    recibirMensaje({ from: 'whatsapp:+573007', toNumber: 'whatsapp:+15550001', texto: 'quiero la nevera' });
+    await correrTurno();
+
+    const res = resultadoDeHerramienta();
+    expect(res.exito).toBe(false);
+    expect(res.error).toContain('No existe');
+    expect(db.agregarAlCarrito).not.toHaveBeenCalled();
+  });
+
+  test('una variante ambigua ("2") no se resuelve a la más barata', () => {
+    const producto = {
+      nombre: 'BASE X', precio: '$1', variantes: [
+        { etiqueta: '1.20', precio: 100 }, { etiqueta: '2.00', precio: 200 }, { etiqueta: '1.60', precio: 150 },
+      ],
+    };
+    expect(encontrarVariante(producto, '2')).toBeNull();      // 1.20 y 2.00 contienen "2"
+    expect(encontrarVariante(producto, '2.00').precio).toBe(200);
+    expect(encontrarVariante(producto, '16').precio).toBe(150); // solo 1.60 contiene "16"
+  });
+});
+
+describe('agendar_cita valida la fecha de verdad', () => {
+  const fechas = require('../../fechas');
+  const hoyTexto = fechas.textoLargo(fechas.hoy());
+
+  async function agendar(args, tel) {
+    mockOpenAICreate
+      .mockResolvedValueOnce(respuestaConTool('agendar_cita', { nombre: 'Ana', ubicacion: 1, hora: '10:00', ...args }))
+      .mockResolvedValue(respuestaFinal);
+    recibirMensaje({ from: tel, toNumber: 'whatsapp:+15550001', texto: 'agéndame' });
+    await correrTurno();
+    return resultadoDeHerramienta();
+  }
+
+  test('rechaza un día de la semana que no coincide con la fecha', async () => {
+    const res = await agendar({ dia: 'martes 3 de junio de 2099' }, 'whatsapp:+573010');
+    expect(res.exito).toBe(false);
+    expect(res.error).toContain('NO es martes');
+    expect(db.guardarCita).not.toHaveBeenCalled();
+  });
+
+  test('rechaza fechas pasadas', async () => {
+    const pasado = await agendar({ dia: 'miércoles 3 de junio de 2020' }, 'whatsapp:+573011');
+    expect(pasado.exito).toBe(false);
+    expect(pasado.error).toContain('ya pasó');
+  });
+
+  test('rechaza domingos', async () => {
+    const domingo = await agendar({ dia: '2099-01-04' }, 'whatsapp:+573012'); // 4 ene 2099 es domingo
+    expect(domingo.exito).toBe(false);
+    expect(domingo.error).toContain('domingo');
+  });
+
+  test('rechaza 17:30 entre semana (última cita 16:00)', async () => {
+    const res = await agendar({ dia: 'lunes 5 de enero de 2099', hora: '17:30' }, 'whatsapp:+573013');
+    expect(res.exito).toBe(false);
+    expect(res.error).toContain('fuera de horario');
+  });
+
+  test('guarda la cita con la fecha ISO y el texto canónico', async () => {
+    const res = await agendar({ dia: 'martes 6 de enero de 2099', hora: '2:30 pm' }, 'whatsapp:+573014');
+    expect(res.exito).toBe(true);
+    expect(db.guardarCita).toHaveBeenCalledWith('whatsapp:+573014', expect.objectContaining({
+      dia: 'Martes 6 de enero de 2099', fecha: '2099-01-06', hora: '14:30', nombre: 'Ana',
+    }));
+    expect(hoyTexto).toMatch(/^[a-záéíóú]+ \d{1,2} de [a-záéíóú]+ de \d{4}$/);
+  });
 });
 
 describe('Validacion de precios', () => {

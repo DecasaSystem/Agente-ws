@@ -2,3 +2,11 @@
 node_modules
 *.log
 .DS_Store
+
+# Volcado de la base de datos: contiene el host real y datos personales de clientes
+# (teléfonos). No debe versionarse ni distribuirse con el código.
+baseDatos.sql
+*.sql
+
+# Configuración de un negocio concreto, si se decide no versionarla
+negocio-*.json

@@ -1,19 +1,36 @@
 require('dotenv').config();
 const mysql = require('mysql2/promise');
+const negocio = require('./negocio');
 
 // ─────────────────────────────────────────────
 // CONFIGURACIÓN
 // ─────────────────────────────────────────────
 
-const TIMEOUT_INACTIVIDAD_MINUTOS = 45; // Aumentado de 10 a 45 min
+// Comprar un mueble no es una decisión de 45 minutos: el cliente arma el carrito, se va a
+// almorzar y vuelve. Antes, a los 45 min se borraba el historial Y el carrito, así que
+// volvía y Elena no sabía quién era ni qué quería. Ahora hay tres ventanas distintas:
+//
+//   VENTANA_CONVERSACION_MINUTOS — a partir de aquí se considera que el cliente "vuelve"
+//     en otra visita: solo se cierran los flujos a medias (agenda en curso, comparación
+//     pendiente) y se le avisa al modelo del tiempo transcurrido para que retome con
+//     naturalidad. El carrito y el historial NO se tocan.
+//   TIMEOUT_CARRITO_HORAS — después de esto sí se descarta el carrito y el hilo: ya no es
+//     la misma intención de compra.
+//   RETENCION_HISTORIAL_DIAS — barrido de fondo, igual que en el agente de Instagram.
+const VENTANA_CONVERSACION_MINUTOS = negocio.ventanaConversacionMinutos;
+const TIMEOUT_CARRITO_HORAS        = negocio.timeoutCarritoHoras;
+const RETENCION_HISTORIAL_DIAS     = negocio.retencionHistorialDias;
 
-// Red de seguridad para conversaciones "tomadas" por un asesor (ver RedesController
-// en decasa-api, que ahora activa/libera transferido con los botones Tomar/Terminar):
-// si el asesor se olvida de dar "Terminar", el cliente no debe quedar mudo para
-// siempre. Pero tampoco puede ser el mismo timeout corto de limpieza general (45 min),
-// porque el asesor puede tardar en responder sin que eso signifique que abandonó el
-// caso. Se usa solo cuando transferido = true.
-const TIMEOUT_TRANSFERIDO_MINUTOS = 360; // 6 horas
+// Nombre anterior, conservado porque lo usan las llamadas existentes y los tests.
+const TIMEOUT_INACTIVIDAD_MINUTOS = VENTANA_CONVERSACION_MINUTOS;
+
+// Red de seguridad para conversaciones transferidas a asesor que NADIE ha tomado aún en
+// el panel de Redes (la IA pidió asesor y la tarjeta sigue pendiente): el cliente no
+// debe quedar mudo para siempre, pero tampoco vale el timeout corto de limpieza general
+// (45 min), porque un asesor puede tardar en atenderla sin que eso signifique abandono.
+// Una vez el asesor pulsa "Tomar", NO hay timeout: la IA calla hasta que él pulse
+// "Terminar" (ver verificarYLimpiarInactividad y tomadaPorAsesor).
+const TIMEOUT_TRANSFERIDO_MINUTOS = negocio.timeoutTransferidoMinutos;
 
 function parseJSONField(value) {
   if (!value) return null;
@@ -120,7 +137,7 @@ async function getHistorial(telefono, limite = 12) {
   const [mensajes] = await pool.query(
     `SELECT role, contenido FROM conversaciones 
      WHERE usuario_id = ? 
-     ORDER BY created_at DESC LIMIT ?`,
+     ORDER BY id DESC LIMIT ?`,
     [usuarioId, limite]
   );
 
@@ -338,6 +355,52 @@ async function estaTransferida(telefono) {
   return estado.transferido;
 }
 
+// true si un asesor tiene este chat TOMADO desde el panel de Redes: hay una tarjeta en
+// estado 'tomada' en conversaciones_wa (tabla del sistema de ventas; este agente y
+// decasa-api comparten la misma base de datos, ver RedesController::silenciarBot).
+// Si la tabla no existe (BD de desarrollo) se asume que no y el bot sigue como antes.
+async function tomadaPorAsesor(telefono) {
+  try {
+    const [rows] = await pool.query(
+      "SELECT 1 FROM conversaciones_wa WHERE telefono = ? AND estado = 'tomada' LIMIT 1",
+      [telefono.replace('whatsapp:', '')]
+    );
+    return rows.length > 0;
+  } catch (e) {
+    console.warn('[DB] no se pudo consultar conversaciones_wa:', e.message);
+    return false;
+  }
+}
+
+// true si este cliente ya tiene una solicitud de asesor sin atender en el panel (tarjeta
+// 'pendiente' de tipo asesor/personalización de los últimos 3 días — el margen cubre un
+// fin de semana). Sirve para no crear una tarjeta nueva cada vez que el cliente vuelve a
+// pedir asesor fuera de horario mientras sigue hablando con la IA.
+async function solicitudAsesorPendiente(telefono) {
+  try {
+    const [rows] = await pool.query(
+      `SELECT 1 FROM conversaciones_wa
+       WHERE telefono = ? AND estado = 'pendiente' AND tipo IN ('asesor', 'personalizacion')
+         AND created_at > NOW() - INTERVAL 3 DAY
+       LIMIT 1`,
+      [telefono.replace('whatsapp:', '')]
+    );
+    return rows.length > 0;
+  } catch (e) {
+    console.warn('[DB] no se pudo consultar conversaciones_wa:', e.message);
+    return false;
+  }
+}
+
+// true si un asesor humano está atendiendo el chat AHORA MISMO: transferido y con la
+// tarjeta tomada en el panel. Se consulta justo antes de que la IA envíe algo, porque
+// el asesor puede pulsar "Tomar" mientras la IA todavía está generando la respuesta.
+async function asesorAtendiendo(telefono) {
+  const estado = await getEstado(telefono);
+  if (!estado.transferido) return false;
+  return tomadaPorAsesor(telefono);
+}
+
 // Registra un evento de negocio para métricas (fire-and-forget desde el caller). Se
 // guarda solo el teléfono limpio, el tipo y un detalle corto — nada sensible.
 async function registrarEvento(telefono, tipo, detalle = null) {
@@ -361,12 +424,35 @@ async function marcarTransferida(telefono) {
 // No funciona con lo que el asesor escribió (en WhatsApp el asesor responde desde su
 // propio número vía wa.me, así que esos mensajes no llegan a este agente), pero sí
 // permite retomar con contexto sin repetir el saludo largo.
+// Devuelve null si no hay reactivación que anunciar, o { atendido } indicando si un
+// asesor llegó a tomar el chat. Importa distinguirlo: cuando nadie tomó la tarjeta y la
+// red de seguridad la liberó, preguntarle "¿cómo quedaste con el asesor?" es absurdo —
+// nunca habló con nadie y lo que toca es disculparse por la demora.
 async function consumirReactivacionAsesor(telefono, maxHoras = 12) {
   const estado = await getEstado(telefono);
   const ts = estado.transferido_at;
-  if (estado.transferido || !ts) return false;
+  if (estado.transferido || !ts) return null;
   await updateEstado(telefono, { transferido_at: null });
-  return (Date.now() - Number(ts)) <= maxHoras * 60 * 60 * 1000;
+  if (Date.now() - Number(ts) > maxHoras * 60 * 60 * 1000) return null;
+  return { atendido: await fueAtendidaPorAsesor(telefono) };
+}
+
+// true si alguna tarjeta de este cliente llegó a estado 'tomada' o 'terminada' en los
+// últimos días: es la señal de que un asesor humano sí estuvo en la conversación.
+async function fueAtendidaPorAsesor(telefono, dias = 3) {
+  try {
+    const [rows] = await pool.query(
+      `SELECT 1 FROM conversaciones_wa
+       WHERE telefono = ? AND estado IN ('tomada', 'terminada')
+         AND created_at > NOW() - INTERVAL ? DAY
+       LIMIT 1`,
+      [telefono.replace('whatsapp:', ''), dias]
+    );
+    return rows.length > 0;
+  } catch (e) {
+    console.warn('[DB] no se pudo saber si un asesor atendió:', e.message);
+    return false;
+  }
 }
 
 async function haEnviadoSaludo(telefono) {
@@ -622,14 +708,61 @@ async function guardarCita(telefono, datos) {
 
   if (usuarios.length === 0) return false;
 
+  // `fecha` (DATE) es la versión estructurada de `dia` (texto): permite ordenar,
+  // detectar duplicados y que el panel de ventas la trate como fecha real.
   await pool.query(
-    `INSERT INTO citas_agentes (usuario_id, telefono, nombre, dia, hora, razon, ubicacion)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
-    [usuarios[0].id, telefonoLimpio, datos.nombre, datos.dia, datos.hora, datos.razon, datos.ubicacion]
+    `INSERT INTO citas_agentes (usuario_id, telefono, nombre, dia, fecha, hora, razon, ubicacion)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    [usuarios[0].id, telefonoLimpio, datos.nombre, datos.dia, datos.fecha ?? null, datos.hora, datos.razon, datos.ubicacion]
   );
 
   await cancelarAgendacion(telefono);
   return true;
+}
+
+// Citas del cliente que siguen en pie (no canceladas) de hoy en adelante, de la más
+// próxima a la más lejana. Sin esto no había forma de cancelar ni de mover una cita:
+// "quiero cancelar mi visita" quedaba a criterio del modelo, que como mucho transfería.
+async function getCitasVigentes(telefono) {
+  try {
+    const [rows] = await pool.query(
+      `SELECT id, nombre, dia, fecha, hora, ubicacion, razon, estado
+       FROM citas_agentes
+       WHERE telefono = ? AND estado <> 'cancelada'
+         AND (fecha IS NULL OR fecha >= CURDATE())
+       ORDER BY fecha IS NULL, fecha ASC, hora ASC`,
+      [telefono.replace('whatsapp:', '')]
+    );
+    return rows;
+  } catch (e) {
+    console.warn('[DB] no se pudieron leer las citas vigentes:', e.message);
+    return [];
+  }
+}
+
+// Marca una cita como cancelada. Devuelve true si de verdad se canceló una fila del
+// cliente (el id se valida contra su teléfono: nadie puede cancelar la cita de otro).
+async function cancelarCita(telefono, citaId) {
+  const [res] = await pool.query(
+    "UPDATE citas_agentes SET estado = 'cancelada' WHERE id = ? AND telefono = ? AND estado <> 'cancelada'",
+    [citaId, telefono.replace('whatsapp:', '')]
+  );
+  return res.affectedRows > 0;
+}
+
+// true si el cliente ya tiene una cita sin cancelar para esa fecha (ISO yyyy-mm-dd).
+async function existeCitaPendiente(telefono, fechaIso) {
+  try {
+    const [rows] = await pool.query(
+      `SELECT 1 FROM citas_agentes
+       WHERE telefono = ? AND fecha = ? AND estado <> 'cancelada' LIMIT 1`,
+      [telefono.replace('whatsapp:', ''), fechaIso]
+    );
+    return rows.length > 0;
+  } catch (e) {
+    console.warn('[DB] no se pudo comprobar cita duplicada:', e.message);
+    return false;
+  }
 }
 
 // ─────────────────────────────────────────────
@@ -691,23 +824,95 @@ async function verificarYLimpiarInactividad(telefono, timeoutMinutos = TIMEOUT_I
 
   const diffMinutos = usuarios[0].diff_minutos;
 
-  // Mientras un asesor tiene la conversación tomada (transferido = true), no la demos
-  // por abandonada con el timeout corto normal — el asesor puede tardar en responder
-  // sin haber abandonado el caso. Solo se libera si pasa el timeout largo (red de
-  // seguridad por si olvidó dar "Terminar" en el panel de Redes).
+  // Si un asesor TOMÓ la conversación en el panel de Redes, no se toca nada: la IA se
+  // queda callada hasta que él pulse "Terminar", sin timeout. Antes se liberaba sola
+  // tras 6 h sin mensajes del cliente — contadas desde su ÚLTIMO mensaje, que "Tomar"
+  // no actualiza — así que bastaba con tomar una solicitud de la noche anterior para
+  // que la limpieza programada (o el primer mensaje del cliente) soltara el flag y la
+  // IA se metiera en la conversación del asesor.
+  //
+  // Si está transferida pero nadie ha tomado la tarjeta (la IA pidió asesor y sigue
+  // pendiente), queda la red de seguridad larga: el asesor puede tardar en atenderla
+  // sin que eso signifique abandono, pero el cliente tampoco debe quedar mudo para
+  // siempre.
   const estado = await getEstado(telefono);
-  const timeoutEfectivo = estado?.transferido ? TIMEOUT_TRANSFERIDO_MINUTOS : timeoutMinutos;
+  if (estado?.transferido && await tomadaPorAsesor(telefono)) return;
 
-  if (diffMinutos >= timeoutEfectivo) {
-    const tienePedidoConfirmado = await tienePedido(telefono);
-
-    if (!tienePedidoConfirmado) {
-      await limpiarConversaciones(telefono);
-      await resetearEstadoSinPedido(telefono);
-      console.log(`[DB] 🧹 Inactividad ${diffMinutos.toFixed(0)} min → limpiando ${telefonoLimpio}`);
-    } else {
-      console.log(`[DB] ⏭️ ${telefonoLimpio} inactivo ${diffMinutos.toFixed(0)} min pero tiene pedido confirmado`);
+  // Transferida y sin que nadie tomara la tarjeta: al pasar la red de seguridad se
+  // libera la IA para que el cliente no quede mudo, pero NO se le borra el carrito ni el
+  // hilo — sigue siendo la misma intención de compra.
+  if (estado?.transferido) {
+    if (diffMinutos >= TIMEOUT_TRANSFERIDO_MINUTOS) {
+      await updateEstado(telefono, { transferido: false });
+      console.log(`[DB] ⏰ ${telefonoLimpio} llevaba ${diffMinutos} min esperando asesor sin que nadie la tomara → la IA retoma`);
     }
+    return;
+  }
+
+  const tienePedidoConfirmado = await tienePedido(telefono);
+  if (tienePedidoConfirmado) {
+    console.log(`[DB] ⏭️ ${telefonoLimpio} inactivo ${diffMinutos} min pero tiene pedido confirmado`);
+    return;
+  }
+
+  // Pasadas las horas del carrito, ya no es la misma compra: se descarta todo.
+  if (diffMinutos >= TIMEOUT_CARRITO_HORAS * 60) {
+    await limpiarConversaciones(telefono);
+    await resetearEstadoSinPedido(telefono);
+    console.log(`[DB] 🧹 ${telefonoLimpio} inactivo ${Math.round(diffMinutos / 60)} h → carrito e historial descartados`);
+    return;
+  }
+
+  // Entre la ventana de conversación y el límite del carrito: solo se cierran los flujos
+  // a medias. El carrito, el último producto y el historial se conservan.
+  if (diffMinutos >= timeoutMinutos) {
+    await limpiarFlujosEnCurso(telefono);
+  }
+}
+
+// Cierra los flujos que quedaron a medias (agenda sin terminar, comparación pendiente,
+// candidatos por elegir) sin tocar el carrito, el último producto ni el historial: si el
+// cliente vuelve horas después, "sí, la quiero" no debe resolverse contra una pregunta de
+// hace medio día, pero su carrito sí debe seguir ahí.
+async function limpiarFlujosEnCurso(telefono) {
+  await updateEstado(telefono, {
+    agendando_cita: false,
+    paso_agenda: 0,
+    datos_agenda: null,
+    candidatos_pendientes: null,
+    subtipo_pendiente: null,
+    comparacion_pendiente: null,
+    comparacion_productos: null,
+    transferencia_medida_pendiente: null,
+    ultimos_mostrados: null,
+  });
+}
+
+// Minutos desde el último mensaje del cliente. Sirve para avisarle al modelo de que el
+// cliente vuelve tras un rato y debe retomar en vez de seguir como si nada.
+async function minutosDesdeUltimaInteraccion(telefono) {
+  try {
+    const [rows] = await pool.query(
+      'SELECT TIMESTAMPDIFF(MINUTE, last_interaction, NOW()) AS min FROM clientes_wa WHERE telefono = ?',
+      [telefono.replace('whatsapp:', '')]
+    );
+    const min = rows[0]?.min;
+    return Number.isFinite(min) ? min : null;
+  } catch {
+    return null;
+  }
+}
+
+// Barrido de fondo del historial antiguo (el hilo ya no se borra por inactividad corta).
+async function limpiarHistorialAntiguo(dias = RETENCION_HISTORIAL_DIAS) {
+  try {
+    const [res] = await pool.query(
+      'DELETE FROM conversaciones WHERE created_at < DATE_SUB(NOW(), INTERVAL ? DAY)',
+      [dias]
+    );
+    if (res.affectedRows) console.log(`[DB] limpieza historial: ${res.affectedRows} mensajes de más de ${dias} días`);
+  } catch (e) {
+    console.error('[DB] error limpiando historial antiguo:', e.message);
   }
 }
 
@@ -744,6 +949,38 @@ async function limpiarConversacionesInactivas(timeoutMinutos = TIMEOUT_INACTIVID
     }
   } catch (error) {
     console.error('[DB] Error en limpieza programada:', error.message);
+  }
+}
+
+// ─────────────────────────────────────────────
+// DEDUPLICACIÓN DURABLE DE MENSAJES DE TWILIO
+// ─────────────────────────────────────────────
+
+// Devuelve true si el SID es nuevo (hay que procesarlo), false si ya se procesó. Antes
+// esto vivía solo en un Set en memoria: tras cada redeploy de Render (frecuentes), un
+// reintento de Twilio volvía a procesar un mensaje ya contestado y el cliente recibía la
+// respuesta dos veces. Ante un fallo de BD se prefiere procesar (arriesgar un duplicado)
+// antes que perder el mensaje del cliente en silencio.
+async function registrarSid(sid) {
+  if (!sid) return true;
+  try {
+    await pool.query('INSERT INTO wa_sids_procesados (sid) VALUES (?)', [sid]);
+    return true;
+  } catch (e) {
+    if (e.code === 'ER_DUP_ENTRY') return false;
+    console.error('[DB] registrarSid falló, se procesa igual:', e.message);
+    return true;
+  }
+}
+
+async function limpiarSidsAntiguos(dias = 2) {
+  try {
+    const [res] = await pool.query(
+      'DELETE FROM wa_sids_procesados WHERE created_at < DATE_SUB(NOW(), INTERVAL ? DAY)', [dias]
+    );
+    if (res.affectedRows) console.log(`[DB] limpieza sids: ${res.affectedRows} eliminados`);
+  } catch (e) {
+    console.error('[DB] error limpiando sids:', e.message);
   }
 }
 
@@ -844,8 +1081,19 @@ module.exports = {
   getProductoPendiente,
   clearProductoPendiente,
   estaTransferida,
+  tomadaPorAsesor,
+  solicitudAsesorPendiente,
+  asesorAtendiendo,
   marcarTransferida,
   consumirReactivacionAsesor,
+  fueAtendidaPorAsesor,
+  limpiarFlujosEnCurso,
+  minutosDesdeUltimaInteraccion,
+  limpiarHistorialAntiguo,
+  registrarSid,
+  limpiarSidsAntiguos,
+  VENTANA_CONVERSACION_MINUTOS,
+  TIMEOUT_CARRITO_HORAS,
   registrarEvento,
   haEnviadoSaludo,
   marcarSaludoEnviado,
@@ -871,6 +1119,9 @@ module.exports = {
   getDatosAgendacion,
   guardarDatosAgendacion,
   guardarCita,
+  existeCitaPendiente,
+  getCitasVigentes,
+  cancelarCita,
   limpiarConversacionesInactivas,
   setTransferenciaMedidaPendiente,
   getTransferenciaMedidaPendiente,
@@ -895,31 +1146,10 @@ module.exports = {
 // INVENTARIO DESDE BD
 // ─────────────────────────────────────────────
 
-const SUBCATEGORIA_KEY_MAP = {
-  comedores:    'bases_comedores',
-  mesas_aux:    'mesas_auxiliares',
-  sillas_aux:   'sillas_auxiliares',
-  cajoneros:    'cajoneros_bifes',
-  sofa_camas:   'sofas_camas'
-};
-
-const NOMBRES_CATEGORIA = {
-  camas:            'Camas',
-  bases_comedores:  'Comedores',
-  sillas_comedor:   'Sillas de Comedor',
-  mesas_centro:     'Mesas de Centro',
-  mesas_noche:      'Mesas de Noche',
-  mesas_auxiliares: 'Mesas Auxiliares',
-  mesas_tv:         'Mesas de TV',
-  sillas_auxiliares:'Sillas Auxiliares',
-  sillas_barra:     'Sillas de Barra',
-  sofas:            'Sofás',
-  sofas_modulares:  'Sofás Modulares',
-  sofas_camas:      'Sofás Cama',
-  cajoneros_bifes:  'Cajoneros',
-  escritorios:      'Escritorios',
-  colchones:        'Colchones'
-};
+// Mapa de categorías crudas de la BD a las claves canónicas, y sus nombres legibles:
+// ambos vienen de negocio.json (mapaCategoriasBD y categorias).
+const SUBCATEGORIA_KEY_MAP = negocio.mapaCategoriasBD;
+const NOMBRES_CATEGORIA    = negocio.CATEGORIAS;
 
 function formatearPrecioFromDB(n) {
   return '$' + parseInt(n).toString().replace(/\B(?=(\d{3})+(?!\d))/g, '.');

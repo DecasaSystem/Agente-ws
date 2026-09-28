@@ -117,6 +117,18 @@ async function initDB() {
     `);
     console.log('✅ Tabla citas_agentes creada o verificada');
 
+    // `fecha` DATE: versión estructurada de `dia` (texto libre). Permite ordenar y
+    // detectar citas duplicadas. `dia` se amplía porque una fecha completa
+    // ("Miércoles 3 de junio de 2026") no cabe en VARCHAR(20).
+    const [colsCitas] = await connection.query('SHOW COLUMNS FROM citas_agentes');
+    const nombresColsCitas = colsCitas.map(c => c.Field);
+    if (!nombresColsCitas.includes('fecha')) {
+      await connection.query('ALTER TABLE citas_agentes ADD COLUMN fecha DATE NULL AFTER dia, ADD INDEX idx_tel_fecha (telefono, fecha)');
+      console.log('✅ Columna fecha añadida a citas_agentes');
+    }
+    try { await connection.query('ALTER TABLE citas_agentes MODIFY dia VARCHAR(60)'); } catch { /* ya está */ }
+    try { await connection.query('ALTER TABLE citas_agentes MODIFY telefono VARCHAR(50) NOT NULL'); } catch { /* ya está */ }
+
     const [colsEstado] = await connection.query('SHOW COLUMNS FROM estado_usuario');
     const nombresColsEstado = colsEstado.map(c => c.Field);
     if (!nombresColsEstado.includes('agendando_cita')) {
@@ -233,6 +245,18 @@ async function initDB() {
       )
     `);
     console.log('✅ Tabla wa_notificaciones_pendientes creada o verificada');
+
+    // Deduplicación durable de mensajes de Twilio. Antes vivía solo en un Set en memoria:
+    // tras un redeploy, un reintento de Twilio hacía que el cliente recibiera dos veces
+    // la misma respuesta. Análoga a ig_mids_procesados.
+    await connection.query(`
+      CREATE TABLE IF NOT EXISTS wa_sids_procesados (
+        sid        VARCHAR(180) PRIMARY KEY,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_created (created_at)
+      )
+    `);
+    console.log('✅ Tabla wa_sids_procesados creada o verificada');
 
     console.log('\n🎉 Base de datos lista!\n');
     

@@ -137,7 +137,7 @@ describe('Contexto compartido por todos los caminos', () => {
   test('el aviso de reactivación tras asesor también llega al flujo de imagen', async () => {
     // Antes solo el flujo de texto consultaba esto; una foto tras hablar con el asesor
     // hacía que Elena arrancara de cero.
-    db.consumirReactivacionAsesor.mockResolvedValue(true);
+    db.consumirReactivacionAsesor.mockResolvedValue({ atendido: true });
 
     recibirMensaje({ from: 'whatsapp:+573001234567', toNumber: TO, texto: 'y esta?', mediaUrl: FOTO, mediaType: 'image/jpeg' });
     await correrTurno();
@@ -145,5 +145,78 @@ describe('Contexto compartido por todos los caminos', () => {
     const { messages } = mockOpenAICreate.mock.calls[0][0];
     const sistemas = messages.filter(m => m.role === 'system').map(m => m.content).join(' ');
     expect(sistemas).toContain('venía siendo atendido por un asesor humano');
+  });
+});
+
+// ── Identificación visual por categoría ───────────────────────────────────────
+// Con inventario cargado, la foto pasa primero por vision-catalogo.js (clasificar +
+// comparar con las fotos de esa categoría) y el modelo recibe el resultado como
+// contexto, en vez de la foto "a secas".
+describe('Foto del cliente con identificación visual por categoría', () => {
+  const { cargarInventario, setPreciosInventarioParaPruebas } = require('../../index');
+
+  beforeAll(async () => {
+    db.getInventarioFromDB.mockResolvedValue({
+      bases_comedores: { nombre: 'Comedores', productos: [
+        { nombre: 'BASE ABANICA', precio: '$2.180.000', medidas: 'Diametro 120 (4 Puestos)', material: 'Chapilla', imagen: 'https://res.cloudinary.com/x/image/upload/v1/a.png', variantes: [] },
+        { nombre: 'BASE 2K',      precio: '$1.480.000', medidas: '1.20 x 0.90 (4 Puestos)', material: 'Madera',   imagen: 'https://res.cloudinary.com/x/image/upload/v1/b.png', variantes: [] },
+      ] },
+      sofas: { nombre: 'Sofás', productos: [
+        { nombre: 'SOFA ROMA', precio: '$3.000.000', medidas: '2.00', material: 'Tela', imagen: 'https://res.cloudinary.com/x/image/upload/v1/c.png', variantes: [] },
+      ] },
+    });
+    await cargarInventario();
+    setPreciosInventarioParaPruebas([2180000, 1480000, 3000000]);
+  });
+
+  afterAll(async () => {
+    db.getInventarioFromDB.mockResolvedValue(null);
+    await cargarInventario();
+  });
+
+  function json(datos) {
+    return { usage: { prompt_tokens: 50, completion_tokens: 10 }, choices: [{ message: { content: JSON.stringify(datos) } }] };
+  }
+
+  test('coincidencia alta: el modelo recibe el producto identificado y solo compara con su categoría', async () => {
+    mockOpenAICreate
+      .mockResolvedValueOnce(json({ es_mueble: true, categorias: ['bases_comedores'], es_captura: true, texto_visible: '', descripcion: 'mesa redonda' }))
+      .mockResolvedValueOnce(json({ coincidencias: [{ indice: 1, similitud: 93, razon: 'misma base en pedestal' }] }))
+      .mockResolvedValue(respuestaSimple('¡Es nuestra BASE ABANICA! 😊'));
+
+    const from = 'whatsapp:+573009990001';
+    recibirMensaje({ from, toNumber: TO, texto: 'cuánto vale esta', mediaUrl: FOTO, mediaType: 'image/jpeg' });
+    await correrTurno();
+
+    expect(mockOpenAICreate).toHaveBeenCalledTimes(3);
+    // La comparación solo lleva las bases de comedor, no el sofá
+    const comparacion = mockOpenAICreate.mock.calls[1][0].messages[1].content;
+    const textos = comparacion.filter(c => c.type === 'text').map(c => c.text).join('\n');
+    expect(textos).toContain('BASE ABANICA');
+    expect(textos).not.toContain('SOFA ROMA');
+
+    // El turno del agente recibe el bloque de coincidencia con los datos reales
+    const turno = mockOpenAICreate.mock.calls[2][0].messages;
+    const userMsg = turno[turno.length - 1];
+    const texto = userMsg.content.find(c => c.type === 'text').text;
+    expect(texto).toContain('COINCIDENCIA VISUAL ALTA');
+    expect(texto).toContain('BASE ABANICA — $2.180.000');
+    expect(texto).toContain('cuánto vale esta');
+    expect(db.registrarEvento).toHaveBeenCalledWith(from, 'vision_catalogo', expect.stringContaining('alta: BASE ABANICA'));
+  });
+
+  test('si la clasificación falla, la foto sigue al modelo como antes', async () => {
+    mockOpenAICreate
+      .mockRejectedValueOnce(new Error('OpenAI caída'))
+      .mockResolvedValue(respuestaSimple('Cuéntame qué mueble buscas 😊'));
+
+    const from = 'whatsapp:+573009990002';
+    recibirMensaje({ from, toNumber: TO, texto: 'esta', mediaUrl: FOTO, mediaType: 'image/jpeg' });
+    await correrTurno();
+
+    const turno = mockOpenAICreate.mock.calls[1][0].messages;
+    const texto = turno[turno.length - 1].content.find(c => c.type === 'text').text;
+    expect(texto).not.toContain('COINCIDENCIA VISUAL');
+    expect(db.addMensaje).toHaveBeenCalledWith(from, 'assistant', 'Cuéntame qué mueble buscas 😊');
   });
 });

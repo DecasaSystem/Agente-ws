@@ -79,10 +79,16 @@ async function correrTurno() {
 beforeEach(() => {
   jest.clearAllMocks();
   jest.useFakeTimers();
+  // Hora fija DENTRO del horario de atención (martes 10:00 am Bogotá = 15:00Z), para
+  // que las transferencias de estos tests no dependan de la hora a la que corra la suite.
+  jest.setSystemTime(new Date('2026-09-15T15:00:00Z'));
   process.env.DECASA_API_URL = 'https://api.decasa.test';
   mockOpenAICreate.mockResolvedValue(respuestaSimple('Claro que sí 😊'));
   mockFetchWithRetry.mockResolvedValue({ ok: true });
   db.estaTransferida.mockResolvedValue(false);
+  db.tomadaPorAsesor.mockResolvedValue(false);
+  db.asesorAtendiendo.mockResolvedValue(false);
+  db.solicitudAsesorPendiente.mockResolvedValue(false);
   db.getHistorial.mockResolvedValue([]);
 });
 
@@ -132,6 +138,126 @@ describe('Cliente transferido a un asesor', () => {
 
     const avisos = mockTwilioCreate.mock.calls.filter(c => String(c[0].body).includes('El asesor te responderá pronto'));
     expect(avisos).toHaveLength(1);
+  });
+
+  test('con el chat TOMADO desde el panel no se manda ni el aviso de espera', async () => {
+    // El asesor ya está hablando con el cliente: el aviso automático "el asesor te
+    // responderá pronto" se metía cada dos minutos en medio de esa conversación.
+    db.estaTransferida.mockResolvedValue(true);
+    db.tomadaPorAsesor.mockResolvedValue(true);
+    const from = 'whatsapp:+573001010101';
+
+    recibirMensaje({ from, toNumber: TO, texto: 'listo, entonces la de 1.60' });
+    await correrTurno();
+
+    expect(mockOpenAICreate).not.toHaveBeenCalled();
+    expect(mockTwilioCreate).not.toHaveBeenCalled();
+    expect(db.addMensaje).toHaveBeenCalledWith(from, 'user', 'listo, entonces la de 1.60');
+  });
+
+  test('si el asesor toma el chat mientras la IA genera, la respuesta se descarta', async () => {
+    // Al entrar el mensaje nadie lo había tomado; el asesor pulsa "Tomar" durante la
+    // llamada a OpenAI. La respuesta ya generada no debe salir encima de su conversación.
+    db.estaTransferida.mockResolvedValue(false);
+    db.asesorAtendiendo.mockResolvedValue(true);
+    const from = 'whatsapp:+573002020202';
+
+    recibirMensaje({ from, toNumber: TO, texto: 'cuánto vale la cama miami' });
+    await correrTurno();
+
+    expect(mockOpenAICreate).toHaveBeenCalled();
+    expect(mockTwilioCreate).not.toHaveBeenCalled();
+    // Lo que dijo el cliente sí queda en el historial; la respuesta descartada, no.
+    expect(db.addMensaje).toHaveBeenCalledWith(from, 'user', 'cuánto vale la cama miami');
+    expect(db.addMensaje).not.toHaveBeenCalledWith(from, 'assistant', expect.anything());
+  });
+
+  test('la propia transferencia de la IA sí llega al cliente aunque el flag ya esté puesto', async () => {
+    // transferir_asesor marca transferido dentro del mismo turno; el re-chequeo no debe
+    // confundir eso con un "Tomar" del panel y callarse justo cuando debe avisar.
+    db.estaTransferida.mockResolvedValue(false);
+    db.asesorAtendiendo.mockResolvedValue(true);
+    mockOpenAICreate
+      .mockResolvedValueOnce(respuestaConTool('transferir_asesor', { motivo: 'quiere precio especial', tipo: 'asesor' }))
+      .mockResolvedValueOnce(respuestaSimple('Te conecto con un asesor 😊'));
+    const from = 'whatsapp:+573003030303';
+
+    recibirMensaje({ from, toNumber: TO, texto: 'quiero hablar con alguien' });
+    await correrTurno();
+
+    const enviados = mockTwilioCreate.mock.calls.map(c => String(c[0].body));
+    expect(enviados.some(b => b.includes('Te conecto con un asesor'))).toBe(true);
+  });
+});
+
+describe('Transferencia fuera de horario', () => {
+  // Martes 17:30 Bogotá: ya nadie va a tomar la tarjeta hoy.
+  const NOCHE = new Date('2026-09-15T22:30:00Z');
+
+  test('crea la tarjeta pero NO silencia a la IA, y le dice al cliente cuándo le escriben', async () => {
+    jest.setSystemTime(NOCHE);
+    db.solicitudAsesorPendiente.mockResolvedValue(false);
+    mockOpenAICreate
+      .mockResolvedValueOnce(respuestaConTool('transferir_asesor', { razon: 'Quiere el costo de envío a Cali' }))
+      .mockResolvedValue(respuestaSimple('Un asesor te escribe mañana a partir de las 8am 😊 Mientras tanto te sigo ayudando'));
+
+    recibirMensaje({ from: 'whatsapp:+573004040404', toNumber: TO, texto: 'cuánto vale el envío a cali?' });
+    await correrTurno();
+
+    // La tarjeta sí llega al panel (el asesor la ve al abrir)…
+    expect(mockFetchWithRetry).toHaveBeenCalled();
+    expect(JSON.parse(mockFetchWithRetry.mock.calls[0][1].body).tipo).toBe('asesor');
+    // …pero la IA no se calla ni borra el historial: sigue atendiendo hasta que pulsen Tomar.
+    expect(db.marcarTransferida).not.toHaveBeenCalled();
+    expect(db.limpiarConversaciones).not.toHaveBeenCalled();
+
+    // Al modelo se le devuelve la instrucción con la hora de respuesta.
+    const segundaLlamada = mockOpenAICreate.mock.calls[1][0];
+    const resultadoTool = JSON.parse(segundaLlamada.messages.find(m => m.role === 'tool').content);
+    expect(resultadoTool.fuera_de_horario).toBe(true);
+    expect(resultadoTool.mensaje).toContain('mañana a partir de las 8am');
+    expect(resultadoTool.mensaje).toContain('sigues aquí');
+  });
+
+  test('a las 4:40 pm ya cuenta como fuera de horario (margen de 20 min antes del cierre)', async () => {
+    jest.setSystemTime(new Date('2026-09-15T21:40:00Z')); // martes 16:40 Bogotá
+    db.solicitudAsesorPendiente.mockResolvedValue(false);
+    mockOpenAICreate
+      .mockResolvedValueOnce(respuestaConTool('transferir_asesor', { razon: 'Pregunta por garantía' }))
+      .mockResolvedValue(respuestaSimple('Mañana te escribe un asesor 😊'));
+
+    recibirMensaje({ from: 'whatsapp:+573005050505', toNumber: TO, texto: 'garantía?' });
+    await correrTurno();
+
+    expect(db.marcarTransferida).not.toHaveBeenCalled();
+  });
+
+  test('a las 4:39 pm todavía transfiere en el momento', async () => {
+    jest.setSystemTime(new Date('2026-09-15T21:39:00Z')); // martes 16:39 Bogotá
+    mockOpenAICreate
+      .mockResolvedValueOnce(respuestaConTool('transferir_asesor', { razon: 'Pregunta por garantía' }))
+      .mockResolvedValue(respuestaSimple('Te conecto con un asesor 😊'));
+
+    recibirMensaje({ from: 'whatsapp:+573006060606', toNumber: TO, texto: 'garantía?' });
+    await correrTurno();
+
+    expect(db.marcarTransferida).toHaveBeenCalled();
+  });
+
+  test('si el cliente vuelve a pedir asesor esa noche, no se crea otra tarjeta', async () => {
+    jest.setSystemTime(NOCHE);
+    db.solicitudAsesorPendiente.mockResolvedValue(true);
+    mockOpenAICreate
+      .mockResolvedValueOnce(respuestaConTool('transferir_asesor', { razon: 'Insiste en hablar con asesor' }))
+      .mockResolvedValue(respuestaSimple('Ya quedó registrado, mañana te escriben 😊'));
+
+    recibirMensaje({ from: 'whatsapp:+573007070707', toNumber: TO, texto: 'y el asesor?' });
+    await correrTurno();
+
+    expect(mockFetchWithRetry).not.toHaveBeenCalled();
+    expect(db.marcarTransferida).not.toHaveBeenCalled();
+    const resultadoTool = JSON.parse(mockOpenAICreate.mock.calls[1][0].messages.find(m => m.role === 'tool').content);
+    expect(resultadoTool.mensaje).toContain('ya estaba registrada');
   });
 });
 
