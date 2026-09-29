@@ -12,6 +12,8 @@ function crear() {
     carritos: new Map(),    // telefono -> [{ producto, precio, cantidad }]
     ultimoProducto: new Map(),
     ultimosMostrados: new Map(),
+    perfiles: new Map(),
+    resumenes: new Map(),
     transferidos: new Set(),
     tomadas: new Set(),     // el asesor pulsó "Tomar" en el panel
     citas: [],
@@ -79,6 +81,10 @@ function crear() {
     resetearEstadoSinPedido: async t => { estado.carritos.set(tel(t), []); },
 
     getUltimoProducto: async t => estado.ultimoProducto.get(tel(t)) ?? null,
+    getPerfil: async t => estado.perfiles.get(tel(t)) ?? null,
+    setPerfil: async (t, perfil) => { estado.perfiles.set(tel(t), perfil); },
+    getResumenConversacion: async t => estado.resumenes.get(tel(t)) ?? null,
+    setResumenConversacion: async (t, r) => { estado.resumenes.set(tel(t), r); },
     setUltimoProducto: async (t, p) => { estado.ultimoProducto.set(tel(t), p); },
     setUltimosMostrados: async (t, productos) => { estado.ultimosMostrados.set(tel(t), productos); },
     getUltimosMostrados: async t => estado.ultimosMostrados.get(tel(t)) ?? null,

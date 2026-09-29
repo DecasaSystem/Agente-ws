@@ -37,6 +37,21 @@ function openaiFalso({ clasificacion, comparaciones }) {
 
 const clasifComedor = { es_mueble: true, categorias: ['bases_comedores'], es_captura: true, texto_visible: '', descripcion: 'mesa redonda en pedestal' };
 
+describe('Elección de modelo', () => {
+  test('clasificar usa el modelo rápido; comparar usa el grande', async () => {
+    const openai = openaiFalso({
+      clasificacion: clasifComedor,
+      comparaciones: [{ coincidencias: [{ indice: 1, similitud: 90, razon: 'igual' }] }],
+    });
+    await vc.identificarPorVision(openai, IMAGEN, { inventarioPlano: INVENTARIO, categorias: CATEGORIAS });
+
+    // La clasificación es un JSON corto en cada foto que llega: no necesita el modelo caro
+    expect(openai.llamadas[0].model).toBe(vc.MODELO_RAPIDO);
+    // La comparación visual sí: ahí el detalle importa
+    expect(openai.llamadas[1].model).toBe(vc.MODELO);
+  });
+});
+
 describe('urlMiniatura', () => {
   test('pide a Cloudinary una miniatura jpg de 256px', () => {
     expect(vc.urlMiniatura('https://res.cloudinary.com/x/image/upload/v1/a.png'))

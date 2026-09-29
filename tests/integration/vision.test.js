@@ -85,8 +85,11 @@ describe('Foto del cliente (flujo normal)', () => {
     expect(mockOpenAICreate).toHaveBeenCalled();
     const { messages } = mockOpenAICreate.mock.calls[0][0];
 
-    // El system prompt lleva anexadas las reglas de visión
-    expect(messages[0].content).toContain('INSTRUCCIÓN PARA IMÁGENES');
+    // Las reglas de visión llegan en su propio mensaje system: el primero es el prompt
+    // estable que OpenAI cachea, así que nada variable puede concatenarse ahí.
+    const sistemas = messages.filter(m => m.role === 'system').map(m => m.content).join(' ');
+    expect(sistemas).toContain('INSTRUCCIÓN PARA IMÁGENES');
+    expect(messages[0].content).not.toContain('INSTRUCCIÓN PARA IMÁGENES');
 
     // Y el mensaje del usuario incluye la imagen en alta calidad
     const userMsg = messages[messages.length - 1];
@@ -114,7 +117,8 @@ describe('Respaldo cuando falla la visualización de sala', () => {
 
     // Y cae al análisis de la foto con el mismo loop
     expect(mockOpenAICreate).toHaveBeenCalled();
-    expect(mockOpenAICreate.mock.calls[0][0].messages[0].content).toContain('INSTRUCCIÓN PARA IMÁGENES');
+    const sistemasRespaldo = mockOpenAICreate.mock.calls[0][0].messages.filter(m => m.role === 'system').map(m => m.content).join(' ');
+    expect(sistemasRespaldo).toContain('INSTRUCCIÓN PARA IMÁGENES');
 
     // Lo que antes NO hacía la copia de respaldo: dejar rastro en el historial
     expect(db.addMensaje).toHaveBeenCalledWith(from, 'assistant', 'Te muestro estas opciones 😊');

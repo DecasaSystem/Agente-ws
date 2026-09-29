@@ -243,3 +243,47 @@ un hook de pre-commit o CI. El test se salta solo si `core/` no existe (deploy a
 
 Comprobado que la detección funciona: al introducir un cambio en una copia, fallan los tres
 mecanismos (test de WS, test de IG y `sync:check`).
+
+---
+
+## Plan de mejoras — Fases 1 y 2 (ver DESPLEGAR-NUEVO-CLIENTE.md)
+
+**Fase 1 — coste y visibilidad**
+- El prompt ya no lleva dentro la fecha ni las instrucciones de visión: van como mensajes
+  `system` aparte para que el prefijo (~4.400 tokens) sea idéntico entre llamadas y OpenAI
+  lo cachee. `logUsoTokens` muestra el `% en caché`; si sale 0 tras el primer mensaje, algo
+  variable se está colando delante del prompt estable.
+- `core/vigilancia.js`: avisa si el agente deja de vender en silencio (inventario vacío,
+  cero conversaciones en horario, notificaciones atascadas, token de Meta por caducar).
+- `GET /stats` también en WhatsApp, con `tasa_transferencia` además del embudo.
+- `clasificarImagen()` usa `OPENAI_MODEL_RAPIDO` (gpt-4o-mini); la comparación visual sigue
+  con el modelo grande.
+
+**Fase 2 — seguimiento proactivo** (`core/seguimientos.js`)
+- Tabla `wa_seguimientos` y worker cada 10 min. **Tres reglas que no se tocan**: solo dentro
+  de la ventana de 24 h de la plataforma, nunca por encima de un asesor humano (pospone), y
+  uno por cliente y motivo (clave única).
+- Recordatorios de cita (24 h y 2 h antes) que se cancelan si la cita se cancela.
+- Carrito abandonado: uno solo a las 24 h, cancelado al confirmar o vaciar.
+- `reportar_objecion`: avisa a ventas cuando el cliente pone un freno, SIN silenciar a la IA
+  ni decírselo al cliente.
+- `TWILIO_WHATSAPP_NUMBER` pasa a ser obligatoria si se usan seguimientos: esos mensajes no
+  nacen de un webhook, así que no hay `To` del que sacar el número de salida.
+
+---
+
+## Plan de mejoras — Fase 3 (calidad medible)
+
+- **`npm run eval`** (`core/evaluacion/`): evalúa el prompt contra el modelo REAL con 25 casos
+  y catálogo sintético. Da % por categoría. No está en `npm test` porque cuesta dinero. Al
+  tocar el prompt: correrlo antes y después. Cuando un cliente real reciba una mala respuesta,
+  añadir ese diálogo a `casos.json`.
+- **`core/memoria.js`**:
+  - *Perfil* (columna `perfil`): presupuesto y productos se capturan solos de las
+    herramientas; el espacio y los gustos, con `recordar_preferencia`. Se inyecta como
+    contexto; un turno sin datos no borra lo anterior y las listas tienen tope.
+  - *Resumen rodante* (columna `resumen_conversacion`): pasados 12 mensajes, los 8 últimos
+    literales + resumen del resto con el modelo rápido, regenerado cada 6 mensajes nuevos. Se
+    le pide explícitamente lo que el cliente DESCARTÓ.
+- `MODELO_RAPIDO` (`OPENAI_MODEL_RAPIDO`, por defecto gpt-4o-mini) se usa para resumir y
+  clasificar imágenes.

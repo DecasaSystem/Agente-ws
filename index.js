@@ -69,12 +69,18 @@ const visionCatalogo = require('./vision-catalogo');
 const reintentos = require('./reintentos');
 const negocio = require('./negocio');
 const { construirSystemPrompt } = require('./prompt');
+const vigilancia = require('./vigilancia');
+const seguimientos = require('./seguimientos');
+const memoria = require('./memoria');
+const log = require('./log');
 const { conReintentos } = reintentos;
 
 // ─── OPENAI ──────────────────────────────────────────────────────────────────
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY || 'sin-configurar' });
 const MODEL = process.env.OPENAI_MODEL || 'gpt-4o';
+// Para tareas simples (resumir la conversación): no hace falta el modelo grande.
+const MODELO_RAPIDO = process.env.OPENAI_MODEL_RAPIDO || 'gpt-4o-mini';
 
 // ─── INVENTARIO Y CATÁLOGOS ───────────────────────────────────────────────────
 
@@ -277,6 +283,35 @@ function debeEnviarAvisoEspera(telefono) {
   if (ahora - ultima < 2 * 60 * 1000) return false;
   _avisosEsperaEnviados.set(telefono, ahora);
   return true;
+}
+
+// Guarda en el perfil del cliente lo que se ha ido sabiendo de él. La mayor parte se captura
+// sola de lo que ya pasa por las herramientas (el presupuesto de buscar_por_presupuesto, los
+// productos que se le muestran, el nombre al agendar): solo lo cualitativo necesita que el
+// modelo lo cuente con recordar_preferencia. Nunca debe romper el turno.
+async function actualizarPerfil(from, cambios) {
+  try {
+    const actual = await db.getPerfil(from);
+    await db.setPerfil(from, memoria.fusionarPerfil(actual, cambios));
+  } catch (e) {
+    console.warn('[memoria] no se pudo actualizar el perfil:', e.message);
+  }
+}
+
+// Lo que core/seguimientos.js necesita del agente para hacer su trabajo: cómo enviar, cómo
+// saber si se puede escribir y cómo consultar la base de datos. Se pasa como dependencias
+// para que el módulo se pueda probar entero sin red ni BD.
+function depsSeguimientos() {
+  return {
+    db,
+    // Sin toNumber (esto no nace de un webhook), enviarTexto cae a TWILIO_WHATSAPP_NUMBER:
+    // por eso esa variable es obligatoria si se usan seguimientos.
+    enviar: (telefono, texto) => enviarTexto(`whatsapp:${String(telefono).replace('whatsapp:', '')}`, null, texto),
+    minutosDesdeUltimoMensaje: telefono => db.minutosDesdeUltimaInteraccion(telefono),
+    hayAsesorAtendiendo: async telefono => (await db.estaTransferida(telefono)) || (await db.tomadaPorAsesor(telefono)),
+    guardarEnHistorial: (telefono, texto) => db.addMensaje(`whatsapp:${String(telefono).replace('whatsapp:', '')}`, 'assistant', texto).catch(() => {}),
+    evento: (telefono, tipo, detalle) => evento(telefono, tipo, detalle),
+  };
 }
 
 // Minutos que el cliente llevaba sin escribir, medidos al entrar el turno (antes de
@@ -1128,6 +1163,35 @@ const TOOLS = [
   {
     type: 'function',
     function: {
+      name: 'recordar_preferencia',
+      description: 'Guarda lo que el cliente cuenta de sí mismo para no hacérselo repetir en otra conversación: para qué espacio busca el mueble ("apartamento pequeño", "sala de la casa nueva", "cuarto de mi hija") y qué le gusta o necesita ("madera clara", "que resista mascotas", "tela que no se manche"). Llámalo en cuanto lo diga, sin anunciárselo. NO guardes datos sensibles ni nada que no sirva para venderle mejor.',
+      parameters: {
+        type: 'object',
+        properties: {
+          espacio:      { type: 'string', description: 'Para qué espacio o persona busca el mueble' },
+          preferencias: { type: 'array', items: { type: 'string' }, description: 'Gustos o necesidades concretas (material, color, resistencia)' },
+        }
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'reportar_objecion',
+      description: 'Úsalo cuando el cliente muestra interés pero pone un freno que tú no puedes resolver: dice que está caro, que lo va a pensar, que lo consulta con su pareja, que lo ve más adelante, o compara con otra tienda. NO le digas al cliente que estás reportando nada y NO te despidas: sigue atendiéndolo con normalidad e intenta resolver la objeción (opciones más económicas, beneficios, financiación). Esto solo avisa al equipo de ventas para que un humano decida si vale la pena hacer seguimiento.',
+      parameters: {
+        type: 'object',
+        properties: {
+          objecion: { type: 'string', description: 'Qué dijo el cliente, en sus palabras o resumido (ej: "dice que está caro", "lo va a consultar con su esposo")' },
+          producto: { type: 'string', description: 'Producto sobre el que puso el freno, si lo hay' },
+        },
+        required: ['objecion']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
       name: 'reportar_proveedor',
       description: 'Úsalo cuando la persona NO es un cliente sino un PROVEEDOR o alguien que quiere VENDERLE a la empresa o proponer una colaboración/alianza comercial (ej: "somos importadores/fabricantes de X", "quiero enviarles mi portafolio", "les ofrezco materia prima/tapas/piedra", "propuesta comercial", "trabajar juntos"). NO lo trates como cliente, NO agendes visita, NO le des ningún número. Solo se notifica internamente al equipo de compras.',
       parameters: {
@@ -1204,6 +1268,9 @@ async function recordarMostrados(from, productos) {
       nombre: p.nombre,
       precio: (p.variantes?.length ? formatearMoneda(precioMinimo(p)) : p.precio)
     })));
+    // Lo que se le muestra queda también en su perfil: si vuelve en unos días, el agente
+    // sabe por dónde iba sin que él tenga que repetirlo.
+    actualizarPerfil(from, { productos_interes: productos.slice(0, 3).map(p => p.nombre) }).catch(() => {});
   } catch (e) { console.warn('[mostrados] no se pudo guardar:', e.message); }
 }
 
@@ -1255,6 +1322,9 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
     case 'buscar_por_presupuesto': {
       const { presupuesto_max, categoria } = args;
       const presupuesto = Number(presupuesto_max);
+      // El presupuesto del cliente llega aquí gratis: se guarda para no tener que
+      // preguntárselo otra vez si vuelve en unos días.
+      if (presupuesto > 0) actualizarPerfil(from, { presupuesto }).catch(() => {});
       if (!presupuesto || presupuesto <= 0) {
         return { exito: false, error: 'Presupuesto inválido.' };
       }
@@ -1399,6 +1469,15 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
       await db.agregarAlCarrito(from, nombreCarrito, precio, Number(cantidad) || 1);
       const itemsActualizados = await db.verCarrito(from);
       const total = itemsActualizados.reduce((s, i) => s + parsearPrecio(i.precio) * (i.cantidad || 1), 0);
+
+      // Si el cliente no vuelve, se le escribe UNA vez a las 24 h. Se reprograma con cada
+      // producto que añade, así el mensaje habla siempre de lo último que le interesó.
+      seguimientos.programarCarritoAbandonado(depsSeguimientos(), {
+        destinatario: telefono,
+        producto:     nombreCarrito,
+        nombre:       await db.getNombreCliente(from).catch(() => null),
+      }).catch(e => console.warn('[seguimientos] carrito abandonado no programado:', e.message));
+
       return {
         exito: true, mensaje: `${nombreCarrito} agregado al carrito por ${precio}.`,
         variante: etiquetaVariante,
@@ -1410,6 +1489,8 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
       const { producto } = args;
       if (!producto) {
         await db.limpiarCarrito(from);
+        // Sin carrito no hay carrito que recordar.
+        seguimientos.cancelar(depsSeguimientos(), { destinatario: telefono, tipo: seguimientos.TIPOS.CARRITO_ABANDONADO }).catch(() => {});
         return { exito: true, mensaje: 'Carrito vaciado completamente.' };
       }
       const items = await db.verCarrito(from);
@@ -1460,6 +1541,8 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
         await db.guardarPedido(telefono, item.producto, item.precio, item.cantidad || 1);
       }
       await db.marcarPedidoConfirmado(from);
+      // El carrito ya es un pedido: recordárselo sería absurdo.
+      seguimientos.cancelar(depsSeguimientos(), { destinatario: telefono, tipo: seguimientos.TIPOS.CARRITO_ABANDONADO }).catch(() => {});
       // Se vacía el carrito (ya es un pedido) pero NO se borra el historial ni el estado:
       // antes `resetearEstadoSinPedido` + `limpiarConversaciones` dejaban al cliente sin
       // contexto justo después de comprar, así que un "¿cuándo me llega?" a los dos
@@ -1558,6 +1641,18 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
 
       const sedeNombre = SEDE_NOMBRE[Number(ubicacion)] ?? UBICACIONES[Number(ubicacion)]
       const tiendaId   = SEDE_TIENDA_ID[Number(ubicacion)] ?? null
+
+      // Recordatorios: el día antes y un par de horas antes. Es el seguimiento con menos
+      // riesgo y más valor — el cliente PIDIÓ la cita, así que el mensaje es esperado — y
+      // reduce que no se presente, que cuesta asesor y producto preparado.
+      seguimientos.programarRecordatoriosCita(depsSeguimientos(), {
+        destinatario: telefono,
+        referencia:   val.fecha.iso,
+        fechaIso:     val.fecha.iso,
+        hora:         horaFormateada,
+        nombre:       nombreLimpio,
+        sede:         sedeNombre,
+      }).catch(e => console.warn('[seguimientos] no se programaron los recordatorios:', e.message));
       const motivoFinal = motivo || null
       const datosCita  = { nombre: nombreLimpio, ubicacion: Number(ubicacion), sede_nombre: sedeNombre, dia: diaCapitalizado, hora: horaFormateada, motivo: motivoFinal }
 
@@ -1611,6 +1706,13 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
 
       const sedeNombre = SEDE_NOMBRE[Number(cita.ubicacion)] ?? UBICACIONES[Number(cita.ubicacion)] ?? `Sede ${cita.ubicacion}`;
       evento(telefono, 'cita_cancelada', `${sedeNombre} — ${cita.dia} ${cita.hora}`);
+      // Sin esto, el cliente que canceló recibiría igual el recordatorio de una visita que
+      // ya no existe.
+      if (cita.fecha) {
+        const fechaRef = cita.fecha instanceof Date ? cita.fecha.toISOString().slice(0, 10) : String(cita.fecha).slice(0, 10);
+        seguimientos.cancelar(depsSeguimientos(), { destinatario: telefono, referencia: fechaRef })
+          .catch(e => console.warn('[seguimientos] no se cancelaron los recordatorios:', e.message));
+      }
       // El panel de ventas tiene que enterarse: si no, el asesor prepara el producto y
       // espera a un cliente que ya avisó que no va.
       notificarRedes(
@@ -1691,6 +1793,33 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
       return { exito: true, mensaje: 'Asesor notificado. Confírmale al cliente que lo estás conectando con un asesor que lo atenderá pronto 😊.' };
     }
 
+    case 'recordar_preferencia': {
+      await actualizarPerfil(from, { espacio: args.espacio, preferencias: args.preferencias });
+      return { ok: true, mensaje: 'Anotado. NO se lo menciones al cliente: sigue la conversación con normalidad.' };
+    }
+
+    case 'reportar_objecion': {
+      // Una objeción es el momento de más valor de la conversación: el cliente quiere el
+      // producto pero algo lo frena. El agente sigue intentándolo, pero el equipo se
+      // entera para poder trabajarlo a mano si vale la pena. Al cliente NO se le dice nada
+      // de esto y la IA no se calla: solo es una señal interna.
+      const objecion = String(args.objecion ?? '').substring(0, 200);
+      evento(telefono, 'objecion', objecion);
+      const estadoObj = await db.getEstado(from);
+      const carritoObj = Array.isArray(estadoObj?.carrito) ? estadoObj.carrito : [];
+      notificarRedes(
+        telefono,
+        `OBJECIÓN SIN RESOLVER 🤔\n${objecion}${args.producto ? `\nProducto: ${args.producto}` : ''}${carritoObj.length ? `\nCarrito: ${carritoObj.map(i => i.producto).join(', ')}` : ''}\nEl cliente sigue hablando con la IA; esto es solo para que ventas decida si hace seguimiento.`,
+        historial,
+        'asesor',
+        { carrito: carritoObj.length ? carritoObj : undefined }
+      );
+      return {
+        ok: true,
+        mensaje: 'Registrado para el equipo de ventas. NO le menciones esto al cliente ni te despidas: sigue atendiéndolo e intenta resolver la objeción tú misma (opciones más económicas con buscar_por_presupuesto, beneficios del producto, formas de pago).'
+      };
+    }
+
     case 'reportar_proveedor': {
       // El número del encargado va SOLO en la notificación interna (el equipo lo ve en
       // el sistema de ventas), nunca en la respuesta al proveedor.
@@ -1714,9 +1843,14 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
 // Log del consumo de tokens de un turno, con costo estimado (tarifas gpt-4o:
 // $2.50/1M tokens de entrada, $10/1M de salida). Permite auditar el gasto desde los
 // logs sin depender solo del dashboard de OpenAI.
-function logUsoTokens(from, promptTok, completionTok, rondas, etiqueta = '') {
-  const costo = (promptTok / 1e6) * 2.5 + (completionTok / 1e6) * 10;
-  console.log(`[tokens]${etiqueta ? ' ' + etiqueta : ''} ${from} · ${rondas} ronda(s) · entrada ${promptTok} · salida ${completionTok} · ~$${costo.toFixed(4)}`);
+// `cacheados` son los tokens de entrada que OpenAI sirvió desde su caché de prefijo, a
+// mitad de precio. Se logean para poder comprobar que el caché está funcionando: si sale
+// 0 a partir del segundo mensaje de una conversación, algo cambiante se está colando
+// delante del prompt estable (ver cómo se arma `messages` en runAgentLoop).
+function logUsoTokens(from, promptTok, completionTok, rondas, etiqueta = '', cacheados = 0) {
+  const costo = ((promptTok - cacheados) / 1e6) * 2.5 + (cacheados / 1e6) * 1.25 + (completionTok / 1e6) * 10;
+  const pctCache = promptTok ? Math.round((cacheados / promptTok) * 100) : 0;
+  console.log(`[tokens]${etiqueta ? ' ' + etiqueta : ''} ${from} · ${rondas} ronda(s) · entrada ${promptTok} (${pctCache}% en caché) · salida ${completionTok} · ~$${costo.toFixed(4)}`);
 }
 
 // Único loop de agente del bot. Antes había TRES copias casi idénticas (texto, visión y
@@ -1759,6 +1893,18 @@ async function runAgentLoop(from, mensajeUsuario, opciones = {}) {
   // preguntarlo aquí daría siempre 0.
   const minutosAusente = _ausenciaTurno.get(from) ?? null;
   _ausenciaTurno.delete(from);
+
+  // Lo que ya se sabe del cliente (presupuesto, espacio, gustos, productos que vio) y el
+  // resumen de lo hablado si la conversación se hizo larga. Ninguno de los dos debe romper
+  // el turno si falla.
+  let contextoPerfil = null, contextoResumen = null;
+  try {
+    contextoPerfil = memoria.construirContextoPerfil(await db.getPerfil(from), { formatearMoneda });
+    const resumen = await db.getResumenConversacion(from);
+    contextoResumen = memoria.construirContextoResumen(resumen);
+  } catch (e) {
+    console.warn('[memoria] no se pudo cargar el contexto del cliente:', e.message);
+  }
   const notaRegreso = (!reactivado && minutosAusente !== null && minutosAusente >= db.VENTANA_CONVERSACION_MINUTOS)
     ? `El cliente vuelve tras ${minutosAusente >= 120 ? `${Math.round(minutosAusente / 60)} horas` : `${minutosAusente} minutos`} sin escribir. Su carrito y lo que ya habló siguen guardados (mira el historial). Salúdalo brevemente reconociendo que había pasado un rato, retoma donde quedó (sin repetir el saludo largo de bienvenida ni volver a preguntarle todo) y confirma si sigue interesado en lo mismo.`
     : null;
@@ -1776,9 +1922,18 @@ async function runAgentLoop(from, mensajeUsuario, opciones = {}) {
   };
 
   const messages = [
-    { role: 'system', content: buildSystemPrompt() + (instruccionesExtra ?? '') },
+    // El primer mensaje es el prompt grande y SIEMPRE idéntico: es el prefijo que OpenAI
+    // cachea (y cobra más barato). Todo lo que cambia —fecha, reglas de visión, notas del
+    // turno— va detrás, en mensajes aparte. Antes la fecha iba dentro del prompt y las
+    // instrucciones de visión se le concatenaban, así que el prefijo cambiaba cada día y en
+    // cada turno con foto: el caché no llegaba a usarse nunca.
+    { role: 'system', content: buildSystemPrompt() },
+    ...(instruccionesExtra ? [{ role: 'system', content: instruccionesExtra }] : []),
+    { role: 'system', content: fechas.bloqueFechaParaPrompt() },
     ...(notaReactivacion ? [{ role: 'system', content: notaReactivacion }] : []),
     ...(notaRegreso ? [{ role: 'system', content: notaRegreso }] : []),
+    ...(contextoPerfil ? [{ role: 'system', content: contextoPerfil }] : []),
+    ...(contextoResumen ? [{ role: 'system', content: contextoResumen }] : []),
     ...(contextoMostrados ? [{ role: 'system', content: contextoMostrados }] : []),
     ...historial.map(m => ({ role: m.role, content: m.content })),
     userMsg,
@@ -1788,7 +1943,7 @@ async function runAgentLoop(from, mensajeUsuario, opciones = {}) {
   const imagenesParaEnviar = [];
 
   // Contadores de tokens para auditar el gasto real por conversación.
-  let tokPrompt = 0, tokCompletion = 0;
+  let tokPrompt = 0, tokCompletion = 0, tokCacheados = 0;
   // Precios que salieron de herramientas en este turno (p.ej. total de carrito): son válidos.
   const preciosVistos = new Set();
 
@@ -1803,7 +1958,7 @@ async function runAgentLoop(from, mensajeUsuario, opciones = {}) {
   const asesorTomoElChat = async (rondas) => {
     if (transfiriendo || !(await db.asesorAtendiendo(from))) return false;
     console.log(`[TRANSFERIDO] ${from}: un asesor tomó el chat a mitad del turno — se descarta la respuesta`);
-    logUsoTokens(from, tokPrompt, tokCompletion, rondas, etiqueta);
+    logUsoTokens(from, tokPrompt, tokCompletion, rondas, etiqueta, tokCacheados);
     return true;
   };
 
@@ -1827,6 +1982,7 @@ async function runAgentLoop(from, mensajeUsuario, opciones = {}) {
     if (response.usage) {
       tokPrompt     += response.usage.prompt_tokens     ?? 0;
       tokCompletion += response.usage.completion_tokens ?? 0;
+      tokCacheados  += response.usage.prompt_tokens_details?.cached_tokens ?? 0;
     }
 
     const choice = response.choices[0];
@@ -1842,7 +1998,7 @@ async function runAgentLoop(from, mensajeUsuario, opciones = {}) {
         let toolArgs = {};
         try { toolArgs = JSON.parse(toolCall.function.arguments); } catch {}
 
-        console.log(`[TOOL] ${toolCall.function.name}(${JSON.stringify(toolArgs).substring(0, 80)})`);
+        log.info('herramienta', { nombre: toolCall.function.name, args: JSON.stringify(toolArgs).substring(0, 120) });
         if (toolCall.function.name === 'transferir_asesor') transfiriendo = true;
         const resultado = await ejecutarHerramienta(toolCall.function.name, toolArgs, from, historial);
 
@@ -1874,7 +2030,7 @@ async function runAgentLoop(from, mensajeUsuario, opciones = {}) {
       if (await asesorTomoElChat(ronda + 1)) return DESCARTADA;
       const texto = choice.message.content || 'Disculpa, no pude generar una respuesta. Por favor intenta de nuevo. 😊';
       validarPrecios(from, texto, preciosVistos);
-      logUsoTokens(from, tokPrompt, tokCompletion, ronda + 1, etiqueta);
+      logUsoTokens(from, tokPrompt, tokCompletion, ronda + 1, etiqueta, tokCacheados);
       return { texto, imagenesParaEnviar };
     }
   }
@@ -1884,7 +2040,7 @@ async function runAgentLoop(from, mensajeUsuario, opciones = {}) {
   // lead se perdía en silencio. Ahora se escala a un asesor humano.
   if (await asesorTomoElChat(maxRondas)) return DESCARTADA;
   evento(from, 'sin_resolver', 'limite de rondas');
-  logUsoTokens(from, tokPrompt, tokCompletion, maxRondas, etiqueta);
+  logUsoTokens(from, tokPrompt, tokCompletion, maxRondas, etiqueta, tokCacheados);
   notificarRedes(
     from,
     'La IA no pudo resolver la solicitud tras varios intentos (límite de rondas de herramientas alcanzado). Revisar la conversación y contactar al cliente.',
@@ -1998,7 +2154,7 @@ app.post('/webhook', (req, res) => {
 
   res.status(200).send('');
 
-  console.log(`[MSG] ${from}: ${incomingMsg || '[media]'}`);
+  log.info('mensaje_recibido', { cliente: from, texto: (incomingMsg || '[media]').substring(0, 120) });
 
   if (!incomingMsg && !mediaUrl) return;
 
@@ -2032,7 +2188,14 @@ app.post('/webhook', (req, res) => {
 });
 
 // Procesa un turno completo del cliente (ya agrupado por el buffer de ráfagas).
-async function procesarMensaje({ from, toNumber, incomingMsg, mediaUrl, mediaType, profileName }) {
+async function procesarMensaje(datos) {
+  // Todo lo que ocurra dentro de este turno queda etiquetado con el mismo id, el canal y el
+  // cliente (ver core/log.js): así se puede reconstruir qué pasó con una persona concreta
+  // aunque se estén atendiendo varias a la vez.
+  return log.conContexto({ canal: 'whatsapp', cliente: datos.from }, () => _procesarMensaje(datos));
+}
+
+async function _procesarMensaje({ from, toNumber, incomingMsg, mediaUrl, mediaType, profileName }) {
   try {
     // Cuánto llevaba el cliente sin escribir, medido ANTES de que getOrCreateUsuario
     // refresque last_interaction. runAgentLoop lo usa para que Elena retome la
@@ -2218,7 +2381,12 @@ async function procesarMensaje({ from, toNumber, incomingMsg, mediaUrl, mediaTyp
     // flujo de compra que escribía "buenas" recibía otra vez el bloque de bienvenida
     // completo con categorías y horario, como si Elena no lo conociera.
     const esSoloSaludo = /^(hola|holis|holi|holaa|holaaa|buenas?|buenos\s*(dias?|tardes?|noches?)|que\s*tal|hi\b|hello\b|hey\b|saludos|como\s*est[aá]s?)[\s!.¡?]*$/.test(msgLow);
-    const historialPrevio = await db.getHistorial(from, 12);
+    // En conversaciones largas se pasan los últimos mensajes literales más un resumen de
+    // los anteriores: antes se truncaba en 12 sin resumen y el agente olvidaba el principio,
+    // incluido lo que el cliente ya había descartado.
+    const { mensajes: historialPrevio } = await memoria.prepararHistorial(
+      { db }, from, { openai, modeloRapido: MODELO_RAPIDO }
+    );
 
     if (esSoloSaludo && historialPrevio.length === 0) {
       const saludado = await enviarTexto(from, toNumber, SALUDO_INICIAL);
@@ -2242,7 +2410,7 @@ async function procesarMensaje({ from, toNumber, incomingMsg, mediaUrl, mediaTyp
     if (descartada) return;
     await db.actualizarLastInteraction(from);
 
-    console.log(`[RESP] ${from}: ${texto.substring(0, 100)}...`);
+    log.info('respuesta', { texto: texto.substring(0, 120) });
 
     // La respuesta entra al historial solo si se entregó (ver enviarTexto): si Twilio
     // falla, en el turno siguiente Elena no puede darla por dicha.
@@ -2313,6 +2481,17 @@ app.post('/refresh-inventario', requireAgentToken, async (req, res) => {
   await cargarCatalogos();
   sincronizarHashesCatalogo().catch(e => console.error('[hash-imagen] error:', e.message));
   res.json({ status: 'ok', categorias: Object.keys(inventario).length, catalogos: Object.keys(catalogosDB).length });
+});
+
+// Métricas de negocio: el embudo del agente. Mismo formato que /stats del agente de
+// Instagram para poder sumarlos en un panel único.
+app.get('/stats', requireAgentToken, async (req, res) => {
+  try {
+    const dias = Math.min(Math.max(parseInt(req.query.dias ?? '30') || 30, 1), 365);
+    res.json(await db.getMetricas(dias));
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.get('/health', async (req, res) => {
@@ -2428,6 +2607,23 @@ async function startServer() {
     procesarColaNotificaciones().catch(e => console.error('[REDES] worker cola:', e.message));
   }, 60 * 1000);
 
+  // Vigilancia del negocio: avisa si el agente deja de vender EN SILENCIO (inventario
+  // vacío, ninguna conversación en horario, notificaciones que no llegan al panel). Las
+  // otras alertas solo cubren que el proceso se caiga; esto cubre que siga en pie sin
+  // servir para nada.
+  vigilancia.iniciarVigilancia({
+    contarConversaciones:          horas => db.contarConversacionesRecientes(horas),
+    contarInventario:              () => Object.values(inventario).reduce((n, c) => n + (c.productos?.length ?? 0), 0),
+    contarNotificacionesAtascadas: () => db.contarNotificacionesAtascadas(),
+    estadoHorario:                 () => estadoHorario(),
+    alertar,
+  }, 30);
+
+  // Seguimientos: recordatorios de cita y carrito abandonado. Solo se envían dentro de la
+  // ventana de 24 h de la plataforma y nunca por encima de un asesor humano (ver
+  // core/seguimientos.js).
+  seguimientos.iniciarWorker(depsSeguimientos(), 10);
+
   const gracefulShutdown = (signal) => {
     console.log(`\n[SERVER] ${signal} recibido. Cerrando...`);
     server.close(() => { db.pool.end().catch(() => {}); });
@@ -2447,7 +2643,7 @@ if (require.main === module) {
 }
 
 module.exports = {
-  app, startServer, extraerPrecios, validarPrecios, setPreciosInventarioParaPruebas,
+  app, startServer, TOOLS, extraerPrecios, validarPrecios, setPreciosInventarioParaPruebas,
   // Expuestos para pruebas del buffer de ráfagas y del troceo de mensajes largos.
   recibirMensaje, procesarMensaje, encolar, trocearTexto, DEBOUNCE_MS,
   // Expuestos para pruebas de variantes de precio.

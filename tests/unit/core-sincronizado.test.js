@@ -17,10 +17,21 @@ const hayCore = fs.existsSync(CORE);
 // comparar y el test se salta en vez de fallar.
 const describeSiHayCore = hayCore ? describe : describe.skip;
 
+// Recorre core/ incluidas las subcarpetas (core/evaluacion/…), igual que hace el script de
+// sincronización: si solo se mirara la raíz, un archivo compartido de una subcarpeta podría
+// divergir sin que nadie se enterara.
+function listarCompartidos(dir, prefijo = '') {
+  const encontrados = [];
+  for (const entrada of fs.readdirSync(dir, { withFileTypes: true })) {
+    const relativo = prefijo ? path.join(prefijo, entrada.name) : entrada.name;
+    if (entrada.isDirectory()) encontrados.push(...listarCompartidos(path.join(dir, entrada.name), relativo));
+    else if (/\.(js|json)$/.test(entrada.name)) encontrados.push(relativo);
+  }
+  return encontrados.sort();
+}
+
 describeSiHayCore('Archivos compartidos sincronizados con core/', () => {
-  const compartidos = hayCore
-    ? fs.readdirSync(CORE).filter(f => /\.(js|json)$/.test(f)).sort()
-    : [];
+  const compartidos = hayCore ? listarCompartidos(CORE) : [];
 
   test('core/ tiene los archivos esperados', () => {
     expect(compartidos).toEqual(expect.arrayContaining([

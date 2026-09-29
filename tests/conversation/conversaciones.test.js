@@ -391,3 +391,91 @@ describe('Defensas', () => {
     expect(await db.registrarSid('SM_repetido')).toBe(false);
   });
 });
+
+describe('Objeción del cliente', () => {
+  test('se avisa al equipo pero la IA sigue atendiendo y no se despide', async () => {
+    guion(
+      tool('reportar_objecion', { objecion: 'dice que está caro', producto: 'SOFA ROMA' }),
+      tool('buscar_por_presupuesto', { presupuesto_max: 2000000, categoria: 'camas' }),
+      texto('Te entiendo 😊 Mira, en ese rango tengo la CAMA BALI. ¿Te la muestro?'),
+    );
+    await cliente('uy no, está muy caro para mí');
+
+    // El equipo se entera, con el contexto
+    const avisos = mockFetchWithRetry.mock.calls.map(c => JSON.parse(c[1].body));
+    expect(avisos.some(a => a.resumen.includes('OBJECIÓN SIN RESOLVER'))).toBe(true);
+    expect(avisos.some(a => a.resumen.includes('SOFA ROMA'))).toBe(true);
+
+    // Pero al cliente NO se le menciona nada de eso y la conversación continúa
+    expect(loQueRecibio()).not.toMatch(/asesor|report|registr/i);
+    expect(loQueRecibio()).toContain('CAMA BALI');
+
+    // Y la IA NO queda silenciada: esto no es una transferencia
+    expect(await db.estaTransferida(FROM)).toBe(false);
+    expect(db._estado.eventos.some(e => e.tipo === 'objecion')).toBe(true);
+  });
+});
+
+describe('Memoria entre conversaciones', () => {
+  test('el presupuesto y lo mostrado quedan guardados y vuelven como contexto', async () => {
+    // Primera conversación: menciona presupuesto
+    guion(tool('buscar_por_presupuesto', { presupuesto_max: 3000000, categoria: 'camas' }), texto('Mira estas en tu rango 😊'));
+    await cliente('busco una cama de máximo 3 millones');
+
+    const perfil = await db.getPerfil(FROM);
+    expect(perfil.presupuesto).toBe(3000000);
+    expect(perfil.productos_interes.length).toBeGreaterThan(0);
+
+    // Segunda conversación, días después: el modelo recibe lo que ya se sabe
+    db._estado.minutosAusente.set('+573001112233', 4000);
+    guion(texto('¡Hola de nuevo! ¿Seguimos con la cama? 😊'));
+    await cliente('hola, sigo buscando');
+
+    const contexto = contextoDelModelo();
+    expect(contexto).toContain('LO QUE YA SABES DE ESTE CLIENTE');
+    expect(contexto).toContain('$3.000.000');
+    expect(contexto).toContain('NO se lo recites');
+  });
+
+  test('recordar_preferencia guarda el espacio y los gustos', async () => {
+    guion(
+      tool('recordar_preferencia', { espacio: 'apartamento pequeño', preferencias: ['que resista mascotas'] }),
+      texto('¡Perfecto! Para un apartamento pequeño te recomiendo... 😊'),
+    );
+    await cliente('es para un apartamento pequeño y tengo dos gatos');
+
+    const perfil = await db.getPerfil(FROM);
+    expect(perfil.espacio).toBe('apartamento pequeño');
+    expect(perfil.preferencias).toContain('que resista mascotas');
+
+    // Al cliente no se le dice que se anotó nada
+    expect(loQueRecibio()).not.toMatch(/anot|guard|registr/i);
+  });
+
+  test('en conversación larga se resume lo antiguo en vez de perderlo', async () => {
+    // 30 mensajes previos: el agente ya no los puede pasar todos
+    for (let i = 0; i < 30; i++) {
+      await db.addMensaje(FROM, i % 2 === 0 ? 'user' : 'assistant', `mensaje viejo ${i + 1}`);
+    }
+
+    // El primer llamado del turno es el resumen (modelo rápido), luego la respuesta
+    mockOpenAICreate.mockReset();
+    let llamada = 0;
+    mockOpenAICreate.mockImplementation(async () => {
+      llamada++;
+      if (llamada === 1) return { choices: [{ message: { content: 'El cliente busca cama; descartó la CAMA FIGY por precio.' } }] };
+      return texto('Claro que sí 😊');
+    });
+
+    await cliente('y qué más tienes?');
+
+    // Se generó el resumen y llegó al modelo como contexto
+    const contexto = contextoDelModelo();
+    expect(contexto).toContain('RESUMEN DE LO YA HABLADO');
+    expect(contexto).toContain('descartó la CAMA FIGY');
+
+    // Y no se le pasaron los 30 mensajes literales
+    const ultima = mockOpenAICreate.mock.calls[mockOpenAICreate.mock.calls.length - 1][0];
+    expect(ultima.messages.filter(m => m.role === 'user' || m.role === 'assistant').length).toBeLessThan(15);
+  });
+});

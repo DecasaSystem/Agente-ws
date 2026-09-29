@@ -191,6 +191,16 @@ async function initDB() {
       `);
       console.log('✅ Columna ultimos_mostrados añadida');
     }
+    // Memoria del cliente: lo que se recuerda de él entre conversaciones (perfil) y el
+    // resumen de lo hablado cuando la conversación se hace larga.
+    if (!nombresColsEstado.includes('perfil')) {
+      await connection.query('ALTER TABLE estado_usuario ADD COLUMN perfil JSON');
+      console.log('✅ Columna perfil añadida');
+    }
+    if (!nombresColsEstado.includes('resumen_conversacion')) {
+      await connection.query('ALTER TABLE estado_usuario ADD COLUMN resumen_conversacion JSON');
+      console.log('✅ Columna resumen_conversacion añadida');
+    }
     if (!nombresColsEstado.includes('transferido_at')) {
       await connection.query(`
         ALTER TABLE estado_usuario ADD COLUMN transferido_at JSON
@@ -257,6 +267,27 @@ async function initDB() {
       )
     `);
     console.log('✅ Tabla wa_sids_procesados creada o verificada');
+
+    // Seguimientos: mensajes que el agente envía por iniciativa propia (recordatorio de
+    // cita, carrito abandonado). La clave única (telefono, tipo, referencia) es lo que
+    // garantiza que un mismo seguimiento no se envíe dos veces aunque se programe de más.
+    await connection.query(`
+      CREATE TABLE IF NOT EXISTS wa_seguimientos (
+        id              BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+        telefono        VARCHAR(50) NOT NULL,
+        tipo            VARCHAR(40) NOT NULL,
+        referencia      VARCHAR(60) NULL,
+        datos           JSON,
+        programado_para DATETIME NOT NULL,
+        estado          ENUM('pendiente','enviado','descartado') DEFAULT 'pendiente',
+        posposiciones   INT DEFAULT 0,
+        motivo          VARCHAR(120),
+        created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE KEY uniq_seguimiento (telefono, tipo, referencia),
+        INDEX idx_pendientes (estado, programado_para)
+      )
+    `);
+    console.log('✅ Tabla wa_seguimientos creada o verificada');
 
     console.log('\n🎉 Base de datos lista!\n');
     

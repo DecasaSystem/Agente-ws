@@ -213,6 +213,8 @@ async function getEstado(telefono) {
     transferencia_medida_pendiente: parseJSONField(estado.transferencia_medida_pendiente),
     ultimos_mostrados: parseJSONField(estado.ultimos_mostrados),
     transferido_at: parseJSONField(estado.transferido_at),
+    perfil: parseJSONField(estado.perfil),
+    resumen_conversacion: parseJSONField(estado.resumen_conversacion),
     presupuesto: estado.presupuesto || null
   };
 }
@@ -236,6 +238,8 @@ function _estadoVacio() {
     transferencia_medida_pendiente: null,
     ultimos_mostrados: null,
     transferido_at: null,
+    perfil: null,
+    resumen_conversacion: null,
     presupuesto: null
   };
 }
@@ -259,7 +263,8 @@ async function updateEstado(telefono, datos) {
 
   const camposJSON = ['producto_pendiente', 'carrito', 'datos_agenda', 'candidatos_pendientes',
     'subtipo_pendiente', 'comparacion_pendiente', 'comparacion_productos',
-    'ultimo_producto', 'transferencia_medida_pendiente', 'ultimos_mostrados', 'transferido_at'];
+    'ultimo_producto', 'transferencia_medida_pendiente', 'ultimos_mostrados', 'transferido_at',
+    'perfil', 'resumen_conversacion'];
 
   const camposBool = ['transferido', 'greeting_sent', 'tiene_pedido', 'agendando_cita'];
 
@@ -973,6 +978,170 @@ async function registrarSid(sid) {
   }
 }
 
+// ─────────────────────────────────────────────
+// MEMORIA DEL CLIENTE (perfil y resumen)
+// ─────────────────────────────────────────────
+
+async function getPerfil(telefono) {
+  const estado = await getEstado(telefono);
+  return estado.perfil ?? null;
+}
+
+async function setPerfil(telefono, perfil) {
+  await updateEstado(telefono, { perfil });
+}
+
+async function getResumenConversacion(telefono) {
+  const estado = await getEstado(telefono);
+  return estado.resumen_conversacion ?? null;
+}
+
+async function setResumenConversacion(telefono, resumen) {
+  await updateEstado(telefono, { resumen_conversacion: resumen });
+}
+
+// ─────────────────────────────────────────────
+// SEGUIMIENTOS (mensajes por iniciativa del agente)
+// ─────────────────────────────────────────────
+
+// Programa un seguimiento. Si ya había uno igual pendiente se deja el que estaba: el
+// cliente no debe recibir dos veces lo mismo porque el flujo pasara dos veces por aquí.
+// Si el anterior ya se envió o se descartó, este lo reemplaza (por eso el UPDATE).
+async function programarSeguimiento({ destinatario, tipo, referencia = null, cuando, datos = {} }) {
+  const tel = String(destinatario).replace('whatsapp:', '');
+  const [res] = await pool.query(
+    `INSERT INTO wa_seguimientos (telefono, tipo, referencia, datos, programado_para, estado, posposiciones)
+     VALUES (?, ?, ?, ?, ?, 'pendiente', 0)
+     ON DUPLICATE KEY UPDATE
+       datos           = IF(estado = 'pendiente', datos, VALUES(datos)),
+       programado_para = IF(estado = 'pendiente', programado_para, VALUES(programado_para)),
+       estado          = IF(estado = 'pendiente', estado, 'pendiente'),
+       posposiciones   = IF(estado = 'pendiente', posposiciones, 0)`,
+    [tel, tipo, referencia, JSON.stringify(datos), new Date(cuando)]
+  );
+  return res.affectedRows > 0;
+}
+
+async function getSeguimientosPendientes(limite = 20) {
+  const [rows] = await pool.query(
+    `SELECT id, telefono AS destinatario, tipo, referencia, datos, posposiciones
+     FROM wa_seguimientos
+     WHERE estado = 'pendiente' AND programado_para <= NOW()
+     ORDER BY programado_para ASC LIMIT ?`,
+    [limite]
+  );
+  return rows;
+}
+
+async function marcarSeguimiento(id, estado, motivo = null) {
+  await pool.query(
+    'UPDATE wa_seguimientos SET estado = ?, motivo = ? WHERE id = ?',
+    [estado, motivo ? String(motivo).substring(0, 120) : null, id]
+  );
+}
+
+async function posponerSeguimiento(id, minutos) {
+  await pool.query(
+    `UPDATE wa_seguimientos
+     SET programado_para = DATE_ADD(NOW(), INTERVAL ? MINUTE), posposiciones = posposiciones + 1
+     WHERE id = ?`,
+    [minutos, id]
+  );
+}
+
+// Cancela los pendientes cuando el motivo desaparece (la cita se canceló, el carrito se
+// confirmó). Lo ya enviado no se toca.
+async function cancelarSeguimientos({ destinatario, tipo = null, referencia = null }) {
+  const tel = String(destinatario).replace('whatsapp:', '');
+  const condiciones = ['telefono = ?', "estado = 'pendiente'"];
+  const valores = [tel];
+  if (tipo)       { condiciones.push('tipo = ?');       valores.push(tipo); }
+  if (referencia) { condiciones.push('referencia = ?'); valores.push(String(referencia)); }
+  const [res] = await pool.query(
+    `UPDATE wa_seguimientos SET estado = 'descartado', motivo = 'cancelado' WHERE ${condiciones.join(' AND ')}`,
+    valores
+  );
+  return res.affectedRows;
+}
+
+// ─────────────────────────────────────────────
+// MÉTRICAS DE NEGOCIO
+// ─────────────────────────────────────────────
+
+// El embudo del agente en los últimos N días. Mismo formato que el del agente de
+// Instagram, para poder sumarlos en un panel único: conversaciones → productos vistos →
+// carritos → pedidos, más citas, transferencias y consultas que no se pudieron resolver.
+async function getMetricas(dias = 30) {
+  const [totales] = await pool.query(
+    `SELECT tipo, COUNT(*) AS n FROM wa_eventos
+     WHERE created_at >= DATE_SUB(NOW(), INTERVAL ? DAY)
+     GROUP BY tipo`,
+    [dias]
+  );
+  const [topProductos] = await pool.query(
+    `SELECT detalle AS nombre, COUNT(*) AS veces FROM wa_eventos
+     WHERE tipo = 'producto_visto' AND detalle IS NOT NULL
+       AND created_at >= DATE_SUB(NOW(), INTERVAL ? DAY)
+     GROUP BY detalle ORDER BY veces DESC LIMIT 10`,
+    [dias]
+  );
+  const [topBusquedas] = await pool.query(
+    `SELECT detalle AS termino, COUNT(*) AS veces FROM wa_eventos
+     WHERE tipo = 'busqueda' AND detalle IS NOT NULL
+       AND created_at >= DATE_SUB(NOW(), INTERVAL ? DAY)
+     GROUP BY detalle ORDER BY veces DESC LIMIT 10`,
+    [dias]
+  );
+  const [clientes] = await pool.query(
+    `SELECT COUNT(DISTINCT telefono) AS n FROM wa_eventos
+     WHERE created_at >= DATE_SUB(NOW(), INTERVAL ? DAY)`,
+    [dias]
+  );
+
+  const totalesObj = {};
+  for (const r of totales) totalesObj[r.tipo] = r.n;
+  const conversaciones = totalesObj.conversacion ?? 0;
+  const pedidos        = totalesObj.pedido ?? 0;
+  const transferencias = totalesObj.transferencia ?? 0;
+
+  return {
+    canal: 'whatsapp',
+    dias,
+    clientes_unicos: clientes[0].n,
+    totales: totalesObj,
+    tasa_conversion:     conversaciones ? +(pedidos / conversaciones * 100).toFixed(1) : 0,
+    // Cuántas conversaciones acaban en manos de una persona: si sube mucho, el agente
+    // está dejando de resolver cosas que antes resolvía.
+    tasa_transferencia:  conversaciones ? +(transferencias / conversaciones * 100).toFixed(1) : 0,
+    top_productos: topProductos,
+    top_busquedas: topBusquedas,
+  };
+}
+
+// ─────────────────────────────────────────────
+// SEÑALES DE VIDA (las usa core/vigilancia.js)
+// ─────────────────────────────────────────────
+
+// Conversaciones iniciadas en las últimas N horas. Si esto es 0 en pleno horario de
+// atención, algo se rompió sin avisar (webhook caído, número desconectado...).
+async function contarConversacionesRecientes(horas = 2) {
+  const [rows] = await pool.query(
+    "SELECT COUNT(*) AS n FROM wa_eventos WHERE tipo = 'conversacion' AND created_at >= NOW() - INTERVAL ? HOUR",
+    [horas]
+  );
+  return rows[0]?.n ?? 0;
+}
+
+// Notificaciones al sistema de ventas que llevan varios intentos sin lograr entregarse:
+// son pedidos, citas y solicitudes de asesor que el equipo no está viendo.
+async function contarNotificacionesAtascadas(minIntentos = 3) {
+  const [rows] = await pool.query(
+    'SELECT COUNT(*) AS n FROM wa_notificaciones_pendientes WHERE intentos >= ?',
+    [minIntentos]
+  );
+  return rows[0]?.n ?? 0;
+}
+
 async function limpiarSidsAntiguos(dias = 2) {
   try {
     const [res] = await pool.query(
@@ -1091,6 +1260,18 @@ module.exports = {
   minutosDesdeUltimaInteraccion,
   limpiarHistorialAntiguo,
   registrarSid,
+  getPerfil,
+  setPerfil,
+  getResumenConversacion,
+  setResumenConversacion,
+  getMetricas,
+  programarSeguimiento,
+  getSeguimientosPendientes,
+  marcarSeguimiento,
+  posponerSeguimiento,
+  cancelarSeguimientos,
+  contarConversacionesRecientes,
+  contarNotificacionesAtascadas,
   limpiarSidsAntiguos,
   VENTANA_CONVERSACION_MINUTOS,
   TIMEOUT_CARRITO_HORAS,
