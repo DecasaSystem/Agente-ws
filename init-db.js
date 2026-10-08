@@ -1,6 +1,15 @@
 require('dotenv').config();
 const mysql = require('mysql2/promise');
 
+// Cambios de esquema NUEVOS. Cada uno se aplica una sola vez y queda registrado con su
+// fecha (ver core/migraciones.js). Ejemplo de cómo añadir uno:
+//
+//   { id: '2026-10-01-sugerencias', descripcion: 'tabla de sugerencias',
+//     sql: 'CREATE TABLE sugerencias (...)' },
+//
+// Lo que ya existía arriba se queda como está: es idempotente y corre sin problema.
+const MIGRACIONES = [];
+
 async function initDB() {
   let connection;
 
@@ -288,6 +297,29 @@ async function initDB() {
       )
     `);
     console.log('✅ Tabla wa_seguimientos creada o verificada');
+
+    // Gasto en el modelo por cliente y día: permite cortar a quien se pase del tope antes de
+    // que queme el presupuesto, y ver el costo real por cliente.
+    await connection.query(`
+      CREATE TABLE IF NOT EXISTS wa_gasto_diario (
+        telefono       VARCHAR(50) NOT NULL,
+        dia            DATE NOT NULL,
+        usd            DECIMAL(10,5) DEFAULT 0,
+        tokens_entrada BIGINT DEFAULT 0,
+        tokens_salida  BIGINT DEFAULT 0,
+        turnos         INT DEFAULT 0,
+        PRIMARY KEY (telefono, dia)
+      )
+    `);
+    console.log('✅ Tabla wa_gasto_diario creada o verificada');
+
+    // Migraciones con registro de versión: lo de arriba es idempotente y se queda como está,
+    // pero los cambios NUEVOS van en MIGRACIONES, para saber en qué versión está cada
+    // despliegue. Ver core/migraciones.js.
+    const migraciones = require('./migraciones');
+    await migraciones.aplicar(connection, MIGRACIONES);
+    const version = await migraciones.estado(connection);
+    console.log(`[migraciones] ${version.total} aplicada(s)${version.ultima ? ` · última: ${version.ultima.id}` : ''}`);
 
     console.log('\n🎉 Base de datos lista!\n');
     

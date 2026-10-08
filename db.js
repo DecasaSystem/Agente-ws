@@ -715,14 +715,16 @@ async function guardarCita(telefono, datos) {
 
   // `fecha` (DATE) es la versión estructurada de `dia` (texto): permite ordenar,
   // detectar duplicados y que el panel de ventas la trate como fecha real.
-  await pool.query(
+  const [res] = await pool.query(
     `INSERT INTO citas_agentes (usuario_id, telefono, nombre, dia, fecha, hora, razon, ubicacion)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
     [usuarios[0].id, telefonoLimpio, datos.nombre, datos.dia, datos.fecha ?? null, datos.hora, datos.razon, datos.ubicacion]
   );
 
   await cancelarAgendacion(telefono);
-  return true;
+  // El id viaja en el aviso al sistema de ventas (datos_cita.cita_agente_id): es lo que
+  // enlaza esta cita con la del módulo Citas, para cancelarla después sin adivinar.
+  return res.insertId || true;
 }
 
 // Citas del cliente que siguen en pie (no canceladas) de hoy en adelante, de la más
@@ -975,6 +977,54 @@ async function registrarSid(sid) {
     if (e.code === 'ER_DUP_ENTRY') return false;
     console.error('[DB] registrarSid falló, se procesa igual:', e.message);
     return true;
+  }
+}
+
+// ─────────────────────────────────────────────
+// GASTO EN EL MODELO, POR CLIENTE Y DÍA
+// ─────────────────────────────────────────────
+
+// Suma lo gastado en un turno y devuelve el acumulado del día. Sin esto, un solo número
+// podía mandar cientos de mensajes y quemar el presupuesto de OpenAI sin que nadie lo viera
+// hasta la factura.
+async function registrarGasto(telefono, usd, tokensEntrada = 0, tokensSalida = 0) {
+  const tel = String(telefono).replace('whatsapp:', '');
+  try {
+    await pool.query(
+      `INSERT INTO wa_gasto_diario (telefono, dia, usd, tokens_entrada, tokens_salida, turnos)
+       VALUES (?, CURDATE(), ?, ?, ?, 1)
+       ON DUPLICATE KEY UPDATE
+         usd = usd + VALUES(usd),
+         tokens_entrada = tokens_entrada + VALUES(tokens_entrada),
+         tokens_salida  = tokens_salida + VALUES(tokens_salida),
+         turnos = turnos + 1`,
+      [tel, Number(usd) || 0, tokensEntrada, tokensSalida]
+    );
+  } catch (e) {
+    console.warn('[gasto] no se pudo registrar:', e.message);
+  }
+}
+
+async function getGastoHoy(telefono) {
+  try {
+    const [rows] = await pool.query(
+      'SELECT usd, turnos FROM wa_gasto_diario WHERE telefono = ? AND dia = CURDATE()',
+      [String(telefono).replace('whatsapp:', '')]
+    );
+    return { usd: Number(rows[0]?.usd ?? 0), turnos: Number(rows[0]?.turnos ?? 0) };
+  } catch (e) {
+    // Ante un fallo de lectura se asume que no ha gastado: es peor dejar de atender a un
+    // cliente legítimo por un problema de base de datos.
+    console.warn('[gasto] no se pudo leer:', e.message);
+    return { usd: 0, turnos: 0 };
+  }
+}
+
+async function limpiarGastoAntiguo(dias = 60) {
+  try {
+    await pool.query('DELETE FROM wa_gasto_diario WHERE dia < DATE_SUB(CURDATE(), INTERVAL ? DAY)', [dias]);
+  } catch (e) {
+    console.warn('[gasto] no se pudo limpiar:', e.message);
   }
 }
 
@@ -1260,6 +1310,9 @@ module.exports = {
   minutosDesdeUltimaInteraccion,
   limpiarHistorialAntiguo,
   registrarSid,
+  registrarGasto,
+  getGastoHoy,
+  limpiarGastoAntiguo,
   getPerfil,
   setPerfil,
   getResumenConversacion,
@@ -1336,14 +1389,21 @@ function formatearPrecioFromDB(n) {
   return '$' + parseInt(n).toString().replace(/\B(?=(\d{3})+(?!\d))/g, '.');
 }
 
+// Unidades LIBRES por tienda: disponible − reservada, la misma cuenta que usa el sistema
+// de ventas (CotizacionController, DevolucionController). Antes se miraba solo
+// cantidad_disponible y el agente decía "hay en tienda" de piezas que ya estaban
+// apartadas para la orden de otro cliente. Se sigue llamando cantidad_disponible para
+// no cambiar a quien lo usa.
 async function consultarStock(nombreProducto) {
   const like = `%${nombreProducto}%`;
   const [rows] = await pool.query(
-    `SELECT t.nombre AS tienda, t.es_fabrica, i.cantidad_disponible
+    `SELECT t.nombre AS tienda, t.es_fabrica,
+            (i.cantidad_disponible - COALESCE(i.cantidad_reservada, 0)) AS cantidad_disponible
      FROM inventario i
      JOIN productos p ON i.producto_id = p.id
      JOIN tiendas t   ON i.tienda_id   = t.id
-     WHERE p.nombre LIKE ? AND t.activa = 1 AND i.cantidad_disponible > 0
+     WHERE p.nombre LIKE ? AND p.activo = 1 AND t.activa = 1
+       AND i.cantidad_disponible - COALESCE(i.cantidad_reservada, 0) > 0
      ORDER BY t.es_fabrica ASC, t.nombre ASC`,
     [like]
   );
@@ -1432,7 +1492,8 @@ async function getVariantesPorProducto() {
                   THEN cfg.precio_adicional
                   ELSE p.precio_base END                       AS precio,
              tv.nombre                                         AS tipo,
-             tv.afecta_precio                                  AS afecta_precio
+             tv.afecta_precio                                  AS afecta_precio,
+             CASE WHEN cfg.precio_adicional > 0 THEN 1 ELSE 0 END AS precio_propio
       FROM producto_variante_configs cfg
       JOIN productos p              ON p.id  = cfg.producto_id AND p.activo = 1
       JOIN tipos_variante tv        ON tv.id = cfg.tipo_variante_id AND tv.activo = 1
@@ -1440,7 +1501,7 @@ async function getVariantesPorProducto() {
 
       UNION ALL
 
-      SELECT v.producto_id, v.medida, v.precio_variante, 'Medidas', 1
+      SELECT v.producto_id, v.medida, v.precio_variante, 'Medidas', 1, 1
       FROM producto_variantes v
       JOIN productos p ON p.id = v.producto_id AND p.activo = 1
       WHERE v.activo = 1
@@ -1455,6 +1516,8 @@ async function getVariantesPorProducto() {
         precio:   Number(r.precio ?? 0),
         tipo:     r.tipo ?? 'Opciones',
         afectaPrecio: Number(r.afecta_precio ?? 0) === 1,
+        // precio_adicional > 0: esta opción tiene precio propio (ver precio-variantes.js).
+        precioPropio: Number(r.precio_propio ?? 1) === 1,
       });
     }
 

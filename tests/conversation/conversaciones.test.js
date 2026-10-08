@@ -479,3 +479,35 @@ describe('Memoria entre conversaciones', () => {
     expect(ultima.messages.filter(m => m.role === 'user' || m.role === 'assistant').length).toBeLessThan(15);
   });
 });
+
+describe('Tope de gasto diario', () => {
+  test('al superarlo se pasa a un asesor en vez de seguir respondiendo', async () => {
+    // El cliente ya gastó más de lo que el negocio está dispuesto a pagar hoy
+    db.getGastoHoy = async () => ({ usd: 99, turnos: 400 });
+    guion(texto('esto no debería llegar a enviarse'));
+
+    mockOpenAICreate.mockClear();
+    await cliente('otra pregunta más');
+
+    // No se llama al modelo: es justo lo que hay que evitar
+    expect(mockOpenAICreate).not.toHaveBeenCalled();
+    expect(await db.estaTransferida(FROM)).toBe(true);
+    // Al cliente no se le habla de límites ni de consumo
+    expect(loQueRecibio()).toContain('asesor');
+    expect(loQueRecibio()).not.toMatch(/l[íi]mite|tope|consumo|gasto/i);
+
+    delete db.getGastoHoy;
+  });
+
+  test('por debajo del tope se atiende con normalidad', async () => {
+    db.getGastoHoy = async () => ({ usd: 0.2, turnos: 5 });
+    guion(texto('¡Claro que sí! 😊'));
+
+    await cliente('otra pregunta más');
+
+    expect(mockOpenAICreate).toHaveBeenCalled();
+    expect(await db.estaTransferida(FROM)).toBe(false);
+
+    delete db.getGastoHoy;
+  });
+});

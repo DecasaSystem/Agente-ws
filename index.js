@@ -66,6 +66,10 @@ const { fetchWithRetry } = require('./httpClient');
 const imgHash = require('./image-hash');
 const fechas = require('./fechas');
 const visionCatalogo = require('./vision-catalogo');
+const { leerCatalogos } = require('./catalogos');
+const { randomUUID } = require('crypto');
+const { verificarContrato, describirFaltantes } = require('./contrato-bd');
+const { analizarVariantes, precioMinimoCombinado } = require('./precio-variantes');
 const reintentos = require('./reintentos');
 const negocio = require('./negocio');
 const { construirSystemPrompt } = require('./prompt');
@@ -248,21 +252,22 @@ async function identificarProductoPorImagen(buffer) {
   }
 }
 
+// Los catálogos salen de la BD del sistema de ventas (ver catalogos.js: primero
+// `herramientas`, que es donde se editan, y si no, `configuracion`). knowledge.json
+// queda solo como respaldo si la BD no responde.
 async function cargarCatalogos() {
   try {
-    const [rows] = await db.pool.query(
-      "SELECT clave, valor FROM configuracion WHERE clave LIKE 'catalogo_%'"
-    );
-    if (rows.length > 0) {
-      for (const row of rows) {
-        const key = row.clave.replace('catalogo_', '');
-        catalogosDB[key] = row.valor;
-      }
-      console.log('[CATALOGOS] ✅ Cargados', rows.length, 'catálogos desde BD');
-    }
+    const { fuente, catalogos } = await leerCatalogos(db.pool);
+    if (Object.keys(catalogos).length === 0) return;
+    // Desde herramientas manda la BD completa: un catálogo desactivado en el panel no
+    // puede seguir saliendo porque quedó escrito en knowledge.json.
+    catalogosDB = fuente === 'herramientas'
+      ? catalogos
+      : Object.assign({}, knowledge.catalogos || {}, catalogos);
+    console.log('[CATALOGOS] ✅ Cargados', Object.keys(catalogos).length, 'catálogos desde', fuente);
   } catch (err) {
-    // Si la tabla configuracion no existe o falla, usar knowledge.json como fallback
-    console.warn('[CATALOGOS] Usando fallback desde knowledge.json');
+    // Si la BD falla, se sigue con lo que haya (knowledge.json o la última carga buena).
+    console.warn('[CATALOGOS] Usando fallback desde knowledge.json:', err.message);
   }
 }
 
@@ -531,6 +536,9 @@ async function enviarNotificacionTelegram(telefono, mensaje, historial, tipo = '
     whatsapp_url:   whatsappUrl,
     contacto_url:   whatsappUrl,
     fuente:         'whatsapp',
+    // Identidad de ESTA notificación: el reintento (aquí mismo o desde la cola, horas
+    // después) manda la misma clave y el sistema de ventas no crea una segunda tarjeta.
+    idempotencia:   extra.idempotencia || randomUUID(),
     ...(extra.carrito    && { carrito:    extra.carrito }),
     ...(extra.datos_cita && { datos_cita: extra.datos_cita }),
     ...(extra.tienda_id  && { tienda_id:  extra.tienda_id }),
@@ -553,6 +561,9 @@ async function enviarNotificacionTelegram(telefono, mensaje, historial, tipo = '
 // falla, la notificación se encola en BD para que el worker la reintente con backoff
 // en vez de perderse.
 function notificarRedes(telefono, mensaje, historial, tipo = 'asesor', extra = {}) {
+  // La clave se fija ANTES del primer envío y viaja dentro de `extra`, que es lo que se
+  // guarda en la cola: así el reintento de mañana es la misma notificación, no otra.
+  extra = { ...extra, idempotencia: extra.idempotencia || randomUUID() };
   enviarNotificacionTelegram(telefono, mensaje, historial, tipo, extra)
     .catch(async e => {
       console.warn(`[REDES] envío directo falló (${tipo} ${telefono}), encolando para reintento:`, e.message);
@@ -710,17 +721,35 @@ async function enviarMensajeAdicional(from, toNumber, body, mediaUrl) {
 // una de las medidas. Si todas cuestan igual (color, acabado), el precio es único y las
 // opciones son solo información que enriquece la respuesta.
 function infoPrecioVariantes(p) {
-  const variantes = (p.variantes || []).filter(v => v.etiqueta && v.precio > 0);
-  if (variantes.length === 0) return { precio: p.precio };
+  // Qué opciones deciden el precio, con la regla del sistema de ventas (precio-variantes.js):
+  // los tipos cosméticos (color, tela) ya no se mezclan en el rango de precios.
+  const { dePrecio, cosmeticas, tiposDePrecio, combinaTipos } = analizarVariantes(p);
+  const otrasOpciones = cosmeticas.length ? { otras_opciones: cosmeticas.map(v => v.etiqueta) } : {};
 
-  const precios = [...new Set(variantes.map(v => v.precio))];
-  const opciones = variantes.map(v => ({ opcion: v.etiqueta, precio: v.precio }));
+  if (combinaTipos) {
+    return {
+      precio: null,
+      precio_desde: precioMinimoCombinado(p, parsearPrecio(p.precio)),
+      tipos_de_variante: tiposDePrecio,
+      variantes: dePrecio.map(v => ({ opcion: v.etiqueta, tipo: v.tipo, precio: v.precio })),
+      precio_requiere_asesor: true,
+      nota_variantes: 'El precio de este producto depende de la COMBINACIÓN de varias opciones (' + tiposDePrecio.join(' y ') + '). No calcules ni des un precio exacto: dile "desde X", cuéntale las opciones de cada una y ofrécele pasarlo con un asesor para cotizar la combinación que quiere.',
+      ...otrasOpciones,
+    };
+  }
 
+  if (dePrecio.length === 0) {
+    return cosmeticas.length
+      ? { precio: p.precio, opciones: cosmeticas.map(v => v.etiqueta), tipo_opcion: cosmeticas[0].tipo }
+      : { precio: p.precio };
+  }
+
+  const precios = [...new Set(dePrecio.map(v => v.precio))];
   if (precios.length === 1) {
     return {
       precio: p.precio,
-      opciones: variantes.map(v => v.etiqueta),
-      tipo_opcion: variantes[0].tipo,
+      opciones: [...dePrecio, ...cosmeticas].map(v => v.etiqueta),
+      tipo_opcion: dePrecio[0].tipo,
     };
   }
 
@@ -728,24 +757,27 @@ function infoPrecioVariantes(p) {
     precio: null,
     precio_desde: Math.min(...precios),
     precio_hasta: Math.max(...precios),
-    tipo_variante: variantes[0].tipo,
-    variantes: opciones,
+    tipo_variante: dePrecio[0].tipo,
+    variantes: dePrecio.map(v => ({ opcion: v.etiqueta, precio: v.precio })),
     nota_variantes: 'Este producto tiene varias opciones con PRECIOS DISTINTOS. No des un precio único ni menciones solo el más bajo como si fuera el precio: dile el rango (desde X hasta Y), enumera las opciones disponibles y pregúntale cuál necesita. Cuando la elija, dale el precio exacto de ESA opción.',
+    ...otrasOpciones,
   };
 }
 
 // Precio con el que comparar contra el presupuesto del cliente: el más bajo al que
 // puede llevarse el producto.
 function precioMinimo(p) {
-  const variantes = (p.variantes || []).filter(v => v.precio > 0);
-  if (!variantes.length) return parsearPrecio(p.precio);
-  return Math.min(...variantes.map(v => v.precio));
+  const { dePrecio, combinaTipos } = analizarVariantes(p);
+  if (combinaTipos) return precioMinimoCombinado(p, parsearPrecio(p.precio));
+  if (!dePrecio.length) return parsearPrecio(p.precio);
+  return Math.min(...dePrecio.map(v => v.precio));
 }
 
 // Busca una variante por lo que escribió el cliente ("1.60", "6 pts", "flor morado").
 // Tolerante con la puntuación porque en la BD conviven "1,40", "1.40" y "160".
 function encontrarVariante(producto, textoVariante) {
-  const variantes = (producto?.variantes || []).filter(v => v.etiqueta && v.precio > 0);
+  // Solo entre las opciones que deciden el precio: elegir un color no fija el precio.
+  const variantes = analizarVariantes(producto).dePrecio;
   if (!variantes.length || !textoVariante) return null;
   const norm = s => normalizarTexto(String(s)).replace(/[.,\s]/g, '');
   const buscado = norm(textoVariante);
@@ -1422,7 +1454,16 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
       // Un producto con variantes de precio no puede entrar al carrito "a secas": el
       // pedido llegaría al sistema de ventas con un importe que no corresponde a lo que
       // el cliente quiere. Se exige la opción y el precio sale de la BD, no del modelo.
-      const variantesPrecio = (prodInventario.variantes || []).filter(v => v.etiqueta && v.precio > 0);
+      // Con dos o más tipos de variante con precio, el sistema SUMA los precios de lo que
+      // se elija en cada uno: esa combinación la cotiza un asesor, no el agente (ver
+      // precio-variantes.js). Se registra para saber si el caso existe en el catálogo.
+      const analisisVar = analizarVariantes(prodInventario);
+      if (analisisVar.combinaTipos) {
+        console.warn('[precio-combinado]', nombreReal, analisisVar.tiposDePrecio.join(' + '));
+        evento(telefono, 'precio_combinado', nombreReal);
+        return { exito: false, requiere_asesor: true, error: `El precio de "${nombreReal}" depende de la combinación de varias opciones (${analisisVar.tiposDePrecio.join(' y ')}) y el sistema de ventas lo calcula sumándolas. NO lo agregues ni des un precio exacto: dile el precio desde, cuéntale las opciones y ofrécele pasarlo con un asesor (transferir_asesor) para cotizar la combinación.` };
+      }
+      const variantesPrecio = analisisVar.dePrecio;
       const preciosDistintos = new Set(variantesPrecio.map(v => v.precio)).size > 1;
 
       let etiquetaVariante = null;
@@ -1634,7 +1675,7 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
         };
       }
 
-      await db.guardarCita(from, {
+      const citaAgenteId = await db.guardarCita(from, {
         nombre: nombreLimpio, ubicacion: Number(ubicacion),
         dia: diaCapitalizado, fecha: val.fecha.iso, hora: horaFormateada, razon: motivo
       });
@@ -1654,7 +1695,13 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
         sede:         sedeNombre,
       }).catch(e => console.warn('[seguimientos] no se programaron los recordatorios:', e.message));
       const motivoFinal = motivo || null
-      const datosCita  = { nombre: nombreLimpio, ubicacion: Number(ubicacion), sede_nombre: sedeNombre, dia: diaCapitalizado, hora: horaFormateada, motivo: motivoFinal }
+      // fecha ISO y cita_agente_id: el sistema de ventas guarda la fecha real (no la adivina
+      // del texto) y enlaza su cita con esta para poder cancelarla por id.
+      const datosCita  = {
+        nombre: nombreLimpio, ubicacion: Number(ubicacion), sede_nombre: sedeNombre, dia: diaCapitalizado,
+        fecha: val.fecha.iso, hora: horaFormateada, motivo: motivoFinal,
+        cita_agente_id: typeof citaAgenteId === 'number' ? citaAgenteId : null,
+      }
 
       evento(telefono, 'cita', `${sedeNombre} — ${diaCapitalizado} ${horaFormateada}`)
       const resumenCita = `${nombreLimpio} — ${sedeNombre} — ${diaCapitalizado} ${horaFormateada}${motivoFinal ? ` — ${motivoFinal}` : ''}`
@@ -1850,7 +1897,27 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
 function logUsoTokens(from, promptTok, completionTok, rondas, etiqueta = '', cacheados = 0) {
   const costo = ((promptTok - cacheados) / 1e6) * 2.5 + (cacheados / 1e6) * 1.25 + (completionTok / 1e6) * 10;
   const pctCache = promptTok ? Math.round((cacheados / promptTok) * 100) : 0;
-  console.log(`[tokens]${etiqueta ? ' ' + etiqueta : ''} ${from} · ${rondas} ronda(s) · entrada ${promptTok} (${pctCache}% en caché) · salida ${completionTok} · ~$${costo.toFixed(4)}`);
+  log.info('tokens', {
+    etiqueta: etiqueta || undefined, rondas,
+    entrada: promptTok, cache_pct: pctCache, salida: completionTok, usd: costo.toFixed(4),
+  });
+  // El gasto se acumula por cliente y día para poder cortar al que se pase del tope (ver
+  // superoElTopeDeGasto). Fire-and-forget: contabilizar no debe hacer esperar al cliente.
+  db.registrarGasto(from, costo, promptTok, completionTok).catch(() => {});
+}
+
+// ¿Este cliente ya gastó más de lo que el negocio está dispuesto a pagar hoy? Protege de que
+// un solo número —por error, por un bucle o a propósito— queme el presupuesto de OpenAI.
+// Ante la duda (fallo de BD) devuelve false: es peor dejar de atender a alguien legítimo.
+async function superoElTopeDeGasto(from) {
+  const tope = negocio.topeGastoDiarioUsd;
+  if (!tope || tope <= 0) return false;
+  // Si la consulta devuelve algo inesperado se asume gasto 0: un fallo aquí no puede dejar
+  // de atender a todo el mundo.
+  const { usd = 0, turnos = 0 } = (await db.getGastoHoy(from).catch(() => null)) ?? {};
+  if (!(Number(usd) >= tope)) return false;
+  log.aviso('tope_de_gasto_superado', { usd: usd.toFixed(4), tope, turnos });
+  return true;
 }
 
 // Único loop de agente del bot. Antes había TRES copias casi idénticas (texto, visión y
@@ -1957,7 +2024,7 @@ async function runAgentLoop(from, mensajeUsuario, opciones = {}) {
   const DESCARTADA = { texto: null, imagenesParaEnviar: [], descartada: true };
   const asesorTomoElChat = async (rondas) => {
     if (transfiriendo || !(await db.asesorAtendiendo(from))) return false;
-    console.log(`[TRANSFERIDO] ${from}: un asesor tomó el chat a mitad del turno — se descarta la respuesta`);
+    log.info('respuesta_descartada', { motivo: 'un asesor tomó el chat a mitad del turno' });
     logUsoTokens(from, tokPrompt, tokCompletion, rondas, etiqueta, tokCacheados);
     return true;
   };
@@ -2164,7 +2231,7 @@ app.post('/webhook', (req, res) => {
   // mensaje y su reintento, o más de una instancia corriendo. Sin la segunda, tras cada
   // reinicio el cliente recibía dos veces la misma respuesta.
   if (yaFueProcesado(messageSid)) {
-    console.log(`[DEDUP] ${from} — SID ya procesado (memoria): ${messageSid}`);
+    log.info('sid_duplicado', { cliente: from, sid: messageSid, origen: 'memoria' });
     return;
   }
 
@@ -2174,7 +2241,7 @@ app.post('/webhook', (req, res) => {
       // otra respuesta se trata como mensaje nuevo, porque perder el mensaje de un
       // cliente es mucho peor que responderle dos veces.
       if (esNuevo === false) {
-        console.log(`[DEDUP] ${from} — SID ya procesado (BD): ${messageSid}`);
+        log.info('sid_duplicado', { cliente: from, sid: messageSid, origen: 'bd' });
         return;
       }
       recibirMensaje({ from, toNumber, texto: incomingMsg, mediaUrl, mediaType, profileName });
@@ -2229,6 +2296,26 @@ async function _procesarMensaje({ from, toNumber, incomingMsg, mediaUrl, mediaTy
     // cliente mientras espera — eso creaba una tarjeta "pendiente" nueva por cada
     // mensaje, como si fuera otra solicitud sin reclamar, aunque el cliente ya
     // estuviera siendo atendido. La solicitud original ya tiene el historial.
+    // ── TOPE DE GASTO DIARIO ───────────────────────────────────────
+    // Se comprueba antes de cualquier llamada al modelo. Al cliente no se le dice que hay un
+    // tope (no es su problema): se le pasa a un asesor humano, que es lo que corresponde
+    // cuando una conversación se ha alargado tanto.
+    if (await superoElTopeDeGasto(from)) {
+      if (!(await db.estaTransferida(from))) {
+        await db.marcarTransferida(from);
+        alertar('Cliente superó el tope de gasto diario', `${from} — se transfirió a un asesor. Revisar si es una conversación legítima muy larga o un abuso.`);
+        notificarRedes(
+          from,
+          'La conversación con este cliente superó el límite de consumo del asistente y se transfirió a una persona. Revisar la conversación.',
+          await db.getHistorial(from, 8).catch(() => []),
+          'asesor'
+        );
+        await enviarTexto(from, toNumber, 'Para ayudarte mejor con esto, te paso con uno de nuestros asesores 😊 Te escribirá en un momento.');
+      }
+      await db.addMensaje(from, 'user', incomingMsg || '[media]').catch(() => {});
+      return;
+    }
+
     if (await db.estaTransferida(from)) {
       await db.actualizarLastInteraction(from);
       // Se guarda lo que el cliente escriba MIENTRAS lo atiende el asesor, para que la
@@ -2332,7 +2419,7 @@ async function _procesarMensaje({ from, toNumber, incomingMsg, mediaUrl, mediaTy
           return;
         }
 
-        console.log(`[AUDIO→TEXTO] ${from}: ${textoTranscrito}`);
+        log.info('audio_transcrito', { texto: textoTranscrito.substring(0, 120) });
 
         const historialAudio = await db.getHistorial(from, 12);
         const resultadoAudio = await runAgentLoop(from, textoTranscrito, { historial: historialAudio, etiqueta: 'audio' });
@@ -2494,20 +2581,58 @@ app.get('/stats', requireAgentToken, async (req, res) => {
   }
 });
 
-app.get('/health', async (req, res) => {
-  let usuarios = 0, pedidos = 0, citas = 0;
+// Comprobación del modelo, con caché: el hosting llama a /health cada pocos segundos y no
+// tiene sentido (ni es gratis) preguntarle a OpenAI en cada una.
+let _saludModelo = { ok: null, ts: 0, detalle: null };
+const CACHE_SALUD_MS = 5 * 60 * 1000;
+async function comprobarModelo() {
+  if (Date.now() - _saludModelo.ts < CACHE_SALUD_MS) return _saludModelo;
   try {
-    // citas_agentes es la tabla que escribe este agente (init-db.js); `citas` es la de
-    // Laravel y aquí se consultaba por error.
+    await openai.models.retrieve(MODEL);
+    _saludModelo = { ok: true, ts: Date.now(), detalle: null };
+  } catch (e) {
+    _saludModelo = { ok: false, ts: Date.now(), detalle: e.message?.substring(0, 120) };
+  }
+  return _saludModelo;
+}
+
+// Antes esto devolvía siempre 200 y "status: ok" aunque la base de datos estuviera caída: el
+// hosting lo veía sano y nunca reiniciaba el servicio. Ahora comprueba de verdad las
+// dependencias y responde 503 si alguna imprescindible falla, que es la señal que Render
+// necesita para reiniciar.
+app.get('/health', async (req, res) => {
+  const comprobaciones = {};
+  let usuarios = 0, pedidos = 0, citas = 0;
+
+  // Base de datos: imprescindible. Sin ella el agente no puede atender a nadie.
+  try {
     const [[u], [p], [c]] = await Promise.all([
       db.pool.query('SELECT COUNT(*) as c FROM clientes_wa'),
       db.pool.query('SELECT COUNT(*) as c FROM pedidos'),
       db.pool.query('SELECT COUNT(*) as c FROM citas_agentes')
     ]);
     usuarios = u[0].c; pedidos = p[0].c; citas = c[0].c;
-  } catch {}
-  res.json({
-    status: 'ok', usuarios, pedidos, citas,
+    comprobaciones.base_datos = { ok: true };
+  } catch (e) {
+    comprobaciones.base_datos = { ok: false, error: e.message?.substring(0, 120) };
+  }
+
+  // Inventario cargado: el proceso puede estar en pie y responder "no encontré nada" a todo.
+  const productos = Object.values(inventario).reduce((n, c) => n + (c.productos?.length ?? 0), 0);
+  comprobaciones.inventario = { ok: productos > 0, productos };
+
+  // Modelo: si no responde, el agente no puede contestar.
+  const modelo = await comprobarModelo();
+  comprobaciones.modelo = { ok: modelo.ok !== false, ...(modelo.detalle ? { error: modelo.detalle } : {}) };
+
+  // Credenciales del canal: su ausencia no se nota hasta que hay que responder.
+  comprobaciones.twilio = { ok: !!(process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) };
+
+  const sano = Object.values(comprobaciones).every(c => c.ok);
+  res.status(sano ? 200 : 503).json({
+    status: sano ? 'ok' : 'degradado',
+    comprobaciones,
+    usuarios, pedidos, citas,
     categorias: Object.keys(inventario).length,
     catalogos: Object.keys(catalogosDB).length,
     modelo: MODEL
@@ -2562,6 +2687,15 @@ function revisarSeguridad() {
   }
 }
 
+async function revisarContratoBD() {
+  const { faltantes, error } = await verificarContrato(db.pool);
+  if (error) return console.warn('[contrato-bd] no se pudo verificar:', error);
+  if (faltantes.length === 0) return console.log('[contrato-bd] ✅ esquema del sistema de ventas compatible');
+  const detalle = describirFaltantes(faltantes);
+  console.error('[contrato-bd] ❌ faltan:', detalle);
+  alertar('El sistema de ventas cambió columnas que usa el agente', `Faltan: ${detalle}. Revisar la última migración de decasa-api y contrato-bd.js.`);
+}
+
 async function startServer() {
   console.log(`[SERVER] 🔵 Iniciando ${negocio.nombreAsesora} - ${negocio.nombreEmpresa}...`);
   revisarSeguridad();
@@ -2571,6 +2705,10 @@ async function startServer() {
   } catch (err) {
     console.error('[SERVER] ❌ Error BD:', err.message);
   }
+  // Contrato con el sistema de ventas (contrato-bd.js): si una migración de decasa-api
+  // renombró o quitó algo que el agente lee, se avisa al arrancar y no cuando un cliente
+  // reciba un precio o una foto equivocados.
+  await revisarContratoBD();
 
   const refrescarInventarioYHashes = async () => {
     await cargarInventario();
@@ -2646,6 +2784,8 @@ module.exports = {
   app, startServer, TOOLS, extraerPrecios, validarPrecios, setPreciosInventarioParaPruebas,
   // Expuestos para pruebas del buffer de ráfagas y del troceo de mensajes largos.
   recibirMensaje, procesarMensaje, encolar, trocearTexto, DEBOUNCE_MS,
+  // Expuestos para pruebas de la notificación al sistema de ventas (idempotencia).
+  notificarRedes, procesarColaNotificaciones,
   // Expuestos para pruebas de variantes de precio.
   cargarInventario, infoPrecioVariantes, precioMinimo, encontrarVariante, recalcularPreciosInventario,
   buscarImagenProducto, buscarEnInventario,

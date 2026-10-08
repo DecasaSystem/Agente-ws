@@ -107,6 +107,18 @@ describe('Endpoints de administración', () => {
   });
 
   test('/health sigue siendo público (lo consulta el hosting)', async () => {
-    await request(app).get('/health').expect(200);
+    // Público = no pide token. El código puede ser 200 o 503 según el estado real.
+    const res = await request(app).get('/health');
+    expect([200, 503]).toContain(res.status);
+    expect(res.body.comprobaciones).toBeDefined();
+  });
+
+  test('/health responde 503 si una dependencia falla, para que el hosting reinicie', async () => {
+    // Aquí el inventario está vacío y el modelo no responde: antes esto devolvía 200 y
+    // "status: ok", así que el servicio se quedaba roto sin que nadie lo reiniciara.
+    const res = await request(app).get('/health');
+    expect(res.status).toBe(503);
+    expect(res.body.status).toBe('degradado');
+    expect(res.body.comprobaciones.inventario.ok).toBe(false);
   });
 });

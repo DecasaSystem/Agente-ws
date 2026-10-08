@@ -287,3 +287,18 @@ mecanismos (test de WS, test de IG y `sync:check`).
     le pide explícitamente lo que el cliente DESCARTÓ.
 - `MODELO_RAPIDO` (`OPENAI_MODEL_RAPIDO`, por defecto gpt-4o-mini) se usa para resumir y
   clasificar imágenes.
+
+---
+
+## Plan de mejoras — Fase 4 (operación)
+
+- **`core/log.js`**: logs con contexto de turno (AsyncLocalStorage, sin cambiar firmas).
+  `LOG_FORMATO=json` para agregadores; `log.medir()` para tiempos.
+- **Tope de gasto** (`operacion.topeGastoDiarioUsd`, 1.5 por defecto): tabla
+  `wa_gasto_diario` alimentada por `logUsoTokens`. Al superarlo se transfiere a un asesor
+  ANTES de llamar al modelo. Ante fallo de BD se asume 0: no cortar a clientes legítimos.
+- **`/health`** comprueba BD, inventario, modelo (caché 5 min) y credenciales, y devuelve
+  **503** si algo falla. Antes devolvía 200 aunque la BD estuviera caída.
+- **`core/migraciones.js`** + tabla `esquema_migraciones`: los cambios de esquema NUEVOS van
+  en la lista `MIGRACIONES` de `init-db.js`. Se aplican una vez, quedan registrados y un error
+  de SQL se ve (ya no queda tapado por un catch).
