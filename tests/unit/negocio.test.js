@@ -38,9 +38,28 @@ describe('Configuración del negocio', () => {
     expect(negocio.zonaHoraria).toBe('America/Bogota');
     expect(Object.keys(negocio.UBICACIONES)).toHaveLength(5);
     expect(negocio.SEDE_NOMBRE[4]).toContain('Unicentro');
-    expect(negocio.sedeValida(5)).toBe(true);
+    expect(negocio.sedeValida(4)).toBe(true);
     expect(negocio.sedeValida(6)).toBe(false);
     expect(negocio.horario.sabado.cierra).toBe(12);
+  });
+
+  test('una sede cerrada no se ofrece ni se acepta, pero sigue teniendo nombre', () => {
+    // Circunvalar cerró el 2026-08-27: está en negocio.json con "activa": false.
+    const { negocio } = cargarCon(configBase());
+    expect(negocio.sedeValida(5)).toBe(false);
+    expect(negocio.listaSedes()).not.toContain('11-93');
+    expect(negocio.sedeMax).toBe(4);
+    // Las citas viejas en esa sede se siguen pudiendo nombrar (p. ej. al cancelarlas).
+    expect(negocio.SEDE_NOMBRE[5]).toContain('Circunvalar');
+  });
+
+  test('una tienda cerrada en el sistema de ventas deja de aceptarse para citas', () => {
+    const { negocio } = cargarCon(configBase());
+    negocio.marcarSedesCerradas([2]);
+    expect(negocio.sedeValida(2)).toBe(false);
+    expect(negocio.sedeValida(1)).toBe(true);
+    negocio.marcarSedesCerradas([]);
+    expect(negocio.sedeValida(2)).toBe(true);
   });
 
   test('falta un campo obligatorio: no arranca en silencio', () => {

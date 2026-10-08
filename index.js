@@ -66,12 +66,14 @@ const { fetchWithRetry } = require('./httpClient');
 const imgHash = require('./image-hash');
 const fechas = require('./fechas');
 const visionCatalogo = require('./vision-catalogo');
-const { leerCatalogos } = require('./catalogos');
+const { crearCatalogos } = require('./catalogos');
+const seguridad = require('./seguridad');
 const { randomUUID } = require('crypto');
-const { verificarContrato, describirFaltantes } = require('./contrato-bd');
-const { analizarVariantes, precioMinimoCombinado } = require('./precio-variantes');
+const { crearRevisionSistema } = require('./contrato-bd');
+const { analizarVariantes, precioMinimoCombinado, infoVentaPorJuego } = require('./precio-variantes');
 const reintentos = require('./reintentos');
 const negocio = require('./negocio');
+const horario = require('./horario');
 const { construirSystemPrompt } = require('./prompt');
 const vigilancia = require('./vigilancia');
 const seguimientos = require('./seguimientos');
@@ -90,7 +92,14 @@ const MODELO_RAPIDO = process.env.OPENAI_MODEL_RAPIDO || 'gpt-4o-mini';
 
 let inventario = {};
 // Catálogos cargados desde BD (actualizables sin redeploy)
-let catalogosDB = Object.assign({}, knowledge.catalogos || {});
+// Catálogos: PDF de Herramientas → catálogo visual de Gestión → página de la sección del
+// inventario (ver catalogos.js). knowledge.json queda de respaldo si la BD no responde.
+const catalogos = crearCatalogos({
+  pool: db.pool,
+  respaldo: knowledge.catalogos || {},
+  opciones: { urlBase: negocio.urlCatalogoPublico, mapaCategoriasBD: negocio.mapaCategoriasBD, etiquetas: negocio.CATEGORIAS },
+  alertar,
+});
 // Precios válidos conocidos del inventario, para detectar precios inventados por Elena.
 let preciosInventario = new Set();
 
@@ -252,22 +261,11 @@ async function identificarProductoPorImagen(buffer) {
   }
 }
 
-// Los catálogos salen de la BD del sistema de ventas (ver catalogos.js: primero
-// `herramientas`, que es donde se editan, y si no, `configuracion`). knowledge.json
-// queda solo como respaldo si la BD no responde.
 async function cargarCatalogos() {
   try {
-    const { fuente, catalogos } = await leerCatalogos(db.pool);
-    if (Object.keys(catalogos).length === 0) return;
-    // Desde herramientas manda la BD completa: un catálogo desactivado en el panel no
-    // puede seguir saliendo porque quedó escrito en knowledge.json.
-    catalogosDB = fuente === 'herramientas'
-      ? catalogos
-      : Object.assign({}, knowledge.catalogos || {}, catalogos);
-    console.log('[CATALOGOS] ✅ Cargados', Object.keys(catalogos).length, 'catálogos desde', fuente);
+    await catalogos.cargar();
   } catch (err) {
-    // Si la BD falla, se sigue con lo que haya (knowledge.json o la última carga buena).
-    console.warn('[CATALOGOS] Usando fallback desde knowledge.json:', err.message);
+    console.warn('[CATALOGOS] error cargando, sigue lo último bueno:', err.message);
   }
 }
 
@@ -419,7 +417,16 @@ app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
 function validateTwilioRequest(req, res, next) {
-  if (!process.env.TWILIO_AUTH_TOKEN) return next();
+  // Sin el secreto no se puede saber si el mensaje viene de Twilio: se rechaza (ver
+  // seguridad.js). Antes se dejaba pasar todo "para desarrollo".
+  if (!process.env.TWILIO_AUTH_TOKEN) {
+    if (seguridad.puedeAceptarSinFirma()) return next();
+    if (req.body?.From) {
+      console.error('[seguridad] ❌ Webhook rechazado: falta TWILIO_AUTH_TOKEN, no se puede verificar la firma.');
+      return res.status(503).send('Service Unavailable');
+    }
+    return next();
+  }
   const twilioSignature = req.headers['x-twilio-signature'];
   if (!twilioSignature) {
     if (req.body?.From) return res.status(403).send('Forbidden');
@@ -1019,7 +1026,7 @@ const TOOLS = [
           },
           categoria: {
             type: 'string',
-            description: 'Categoría para filtrar (opcional): camas, bases_comedores, sillas_comedor, sillas_auxiliares, sillas_barra, mesas_centro, mesas_auxiliares, mesas_noche, mesas_tv, sofas, sofas_modulares, sofas_camas, cajoneros_bifes, escritorios, colchones'
+            description: "Categoría para filtrar (opcional): camas, bases_comedores, sillas_comedor, sillas_auxiliares, sillas_barra, mesas_centro, mesas_auxiliares, mesas_noche, mesas_tv, sofas, sofas_modulares, sofas_camas, cajoneros_bifes, escritorios, colchones, cunas, puff, relojes u otra que pida el cliente. Si no estás seguro, no la pongas y busca solo por texto."
           },
           limite: { type: 'number', description: 'Máximo de resultados (default 5, max 10)' }
         },
@@ -1053,6 +1060,14 @@ const TOOLS = [
     function: {
       name: 'consultar_estado',
       description: 'Consulta el estado actual del cliente: carrito, citas agendadas y último producto visto. Úsalo cuando el cliente pregunte por su carrito, sus citas o quiera retomar una conversación.',
+      parameters: { type: 'object', properties: {} }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'consultar_pedidos',
+      description: 'Consulta en el sistema de ventas las COMPRAS que ya hizo el cliente (órdenes), por el número desde el que escribe: estado, fecha estimada de entrega, cuánto se ha entregado y qué productos. Úsalo cuando pregunte cómo va su pedido, cuándo le llega o si ya está listo. No sirve para el carrito del chat (eso es consultar_estado) ni para buscar con otro número.',
       parameters: { type: 'object', properties: {} }
     }
   },
@@ -1099,7 +1114,13 @@ const TOOLS = [
     function: {
       name: 'confirmar_pedido',
       description: 'Confirma la compra de todos los productos en el carrito. Solo cuando el cliente diga que quiere finalizar/confirmar la compra.',
-      parameters: { type: 'object', properties: {} }
+      parameters: {
+        type: 'object',
+        properties: {
+          ciudad:     { type: 'string', description: 'Ciudad o municipio de entrega, si el cliente la dijo (decide si el envío es gratis). Omítelo si no la dio.' },
+          forma_pago: { type: 'string', description: 'Cómo quiere pagar, si lo dijo: efectivo, transferencia, tarjeta o ADDI (decide si aplica el descuento). Omítelo si no lo dijo.' },
+        }
+      }
     }
   },
   {
@@ -1120,13 +1141,13 @@ const TOOLS = [
     type: 'function',
     function: {
       name: 'enviar_catalogo',
-      description: 'Envía el catálogo PDF de una categoría al cliente.',
+      description: 'Envía al cliente el catálogo de una categoría: el catálogo de esa categoría (los de Gestión → Catálogos, que se ven como revista) y, si no hay, la página en línea de esa categoría con fotos y precios actualizados. Sirve para CUALQUIER categoría que se venda (camas, sofás, comedores, cunas, relojes, bancas…), no solo las de la lista.',
       parameters: {
         type: 'object',
         properties: {
           categoria: {
             type: 'string',
-            description: 'Categoría del catálogo: sofas, bases_comedores, sillas_comedor, sillas_auxiliares, sillas_barra, mesas_centro, mesas_noche, mesas_tv, camas, sofas_camas, sofas_modulares, mesas_auxiliares, cajoneros_bifes'
+            description: "La categoría que pide el cliente. Usa la clave si la conoces (sofas, camas, bases_comedores, sillas_comedor, sillas_auxiliares, sillas_barra, mesas_centro, mesas_noche, mesas_tv, mesas_auxiliares, sofas_camas, sofas_modulares, cajoneros_bifes, colchones, escritorios) y, si no está ahí, la palabra del cliente (p. ej. \"cunas\"). Si es ambigua (\"sillas\", \"mesas\"), pregunta antes cuál. Si pide el catálogo en general, sin decir de qué, usa \"todos\": le llega la portada con todos los catálogos."
           }
         },
         required: ['categoria']
@@ -1150,7 +1171,7 @@ const TOOLS = [
         type: 'object',
         properties: {
           nombre: { type: 'string', description: 'Nombre completo del cliente (solo el nombre, sin frases introductorias)' },
-          ubicacion: { type: 'number', description: 'Número de sede (1-5)' },
+          ubicacion: { type: 'number', description: 'Número de sede: uno de los de SEDES en tus instrucciones' },
           dia: { type: 'string', description: 'Fecha de la visita con día de la semana, número de día, mes y año (ej: "miércoles 3 de junio de 2026", "lunes 20 de julio de 2026"). SIEMPRE incluye el año. NUNCA inventes ni asumas el año — confírmalo con el cliente si es ambiguo.' },
           hora: { type: 'string', description: 'Hora en formato HH:MM (ej: "14:00", "09:30")' },
           motivo: { type: 'string', description: 'Motivo de la visita (opcional, solo si el cliente lo menciona)' }
@@ -1237,38 +1258,9 @@ const TOOLS = [
   },
 ];
 
-// Horario real de atención, leído de negocio.json (horario.semana / horario.sabado).
-// (La versión anterior solo miraba la hora 21-8 e ignoraba el día de la semana,
-// así que un mensaje sábado en la tarde o cualquier hora del domingo no avisaba
-// nada aunque el asesor solo fuera a responder hasta el siguiente día hábil.)
-// `margenCierreMin`: minutos antes del cierre a partir de los cuales ya se considera
-// fuera de horario. Se usa para las transferencias: una solicitud que entra a las 4:50
-// pm ya no la va a atender nadie ese día, así que para el cliente es "mañana".
-// `proximaApertura` es el texto para decirle al cliente cuándo le responderá el asesor.
+// Horario real de atención con festivos de Colombia: ver horario.js (compartido).
 function estadoHorario(margenCierreMin = 0, ahora = new Date()) {
-  const partes = new Intl.DateTimeFormat('en-US', {
-    timeZone: negocio.zonaHoraria, weekday: 'short', hour: 'numeric', minute: 'numeric', hour12: false,
-  }).formatToParts(ahora);
-  const dia    = partes.find(p => p.type === 'weekday')?.value;
-  let hora     = parseInt(partes.find(p => p.type === 'hour')?.value);
-  if (hora === 24) hora = 0;
-  const minuto = parseInt(partes.find(p => p.type === 'minute')?.value) || 0;
-  const min    = hora * 60 + minuto;
-
-  const h        = negocio.horario;
-  const rango    = dia === 'Sat' ? h.sabado : h.semana;
-  const apertura = rango.abre * 60;
-  const cierre   = rango.cierra * 60 - margenCierreMin;
-  const abierto  = !(dia === 'Sun' && h.domingoCerrado) && min >= apertura && min < cierre;
-
-  let proximaApertura;
-  if (abierto)                             proximaApertura = null;
-  else if (dia === 'Sun')                  proximaApertura = 'mañana lunes a partir de las 8am';
-  else if (min < apertura)                 proximaApertura = 'hoy a partir de las 8am';
-  else if (dia === 'Fri' || dia === 'Sat') proximaApertura = 'el lunes a partir de las 8am';
-  else                                     proximaApertura = 'mañana a partir de las 8am';
-
-  return { abierto, proximaApertura };
+  return horario.estadoHorario(negocio, margenCierreMin, ahora);
 }
 
 function avisoFueraHorario() {
@@ -1345,7 +1337,11 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
         productos: resultados.map(p => ({
           nombre: p.nombre,
           ...infoPrecioVariantes(p),
+          ...infoVentaPorJuego(p, parsearPrecio(p.precio)),
           material: p.material, medidas: p.medidas,
+          // La descripción que escribió el equipo en Inventario: datos reales para responder
+          // en vez de inventar. Recortada para no inflar el contexto.
+          ...(p.descripcion && { descripcion: String(p.descripcion).slice(0, 300) }),
           foto_disponible: p.tieneImagen, categoria: p.categoriaNombre
         }))
       };
@@ -1379,10 +1375,45 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
         productos: resultados.map(p => ({
           nombre: p.nombre,
           ...infoPrecioVariantes(p),
+          ...infoVentaPorJuego(p, parsearPrecio(p.precio)),
           material: p.material, medidas: p.medidas,
+          // La descripción que escribió el equipo en Inventario: datos reales para responder
+          // en vez de inventar. Recortada para no inflar el contexto.
+          ...(p.descripcion && { descripcion: String(p.descripcion).slice(0, 300) }),
           foto_disponible: p.tieneImagen, categoria: p.categoriaNombre
         }))
       };
+    }
+
+    case 'consultar_pedidos': {
+      // Órdenes reales del sistema de ventas (AgentePedidosController en decasa-api), SOLO
+      // por el número desde el que escribe: Twilio lo entrega verificado. El endpoint ya
+      // devuelve únicamente lo que el cliente puede saber (sin montos ni datos internos).
+      const apiUrl = process.env.DECASA_API_URL;
+      const sinConsulta = { exito: false, error: 'No pude consultar los pedidos en este momento. Discúlpate y ofrécele pasarlo con un asesor (transferir_asesor) para revisarlo.' };
+      if (!apiUrl) return sinConsulta;
+      try {
+        const r = await fetchWithRetry(
+          `${apiUrl}/api/agentes/pedidos?telefono=${encodeURIComponent(telefono)}`,
+          { headers: { 'X-Agent-Token': process.env.DECASA_AGENT_TOKEN || '', Accept: 'application/json' } },
+          1, 15000
+        );
+        const { pedidos = [] } = await r.json();
+        evento(telefono, 'consulta_pedido', String(pedidos.length));
+        if (!pedidos.length) {
+          return {
+            exito: true, pedidos: [],
+            instruccion: 'No hay compras registradas con el número desde el que escribe. Díselo con amabilidad. NO busques con otro número aunque te lo dé (sería información de otra persona): si compró con otro número o a nombre de otra persona, ofrécele pasarlo con un asesor.'
+          };
+        }
+        return {
+          exito: true, pedidos,
+          instruccion: 'Cuéntale el estado de cada compra y la fecha estimada de entrega en palabras (ej. "jueves 30 de octubre"). Si entrega_estimada viene vacía, dile que la fecha se la confirma un asesor. Si entregados < unidades y es mayor que 0, la entrega va por partes. NO inventes nada que no esté aquí; para pagos, saldos, cambios o reclamos, ofrécele un asesor.'
+        };
+      } catch (e) {
+        console.warn('[pedidos] no se pudo consultar:', e.message);
+        return sinConsulta;
+      }
     }
 
     case 'consultar_estado': {
@@ -1487,7 +1518,12 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
         alertar('Modelo pasó un precio distinto al de la BD en agregar_al_carrito', `tel=${telefono} producto="${nombreReal}" modelo=${args.precio} bd=${precio}`);
       }
 
-      const nombreCarrito = etiquetaVariante ? `${nombreReal} (${etiquetaVariante})` : nombreReal;
+      // El asesor tiene que ver que es un juego, no una pieza. Va DENTRO del mismo paréntesis
+      // que la variante: "Armar orden con este carrito" del sistema de ventas quita el último
+      // paréntesis para buscar el producto por su nombre.
+      const piezasJuego = Number(prodInventario.piezasPorJuego ?? 0) > 1 ? `juego de ${prodInventario.piezasPorJuego}` : null
+      const detalleCarrito = [etiquetaVariante, piezasJuego].filter(Boolean).join(', ')
+      const nombreCarrito = detalleCarrito ? `${nombreReal} (${detalleCarrito})` : nombreReal;
 
       const items = await db.verCarrito(from);
       if (items.length >= negocio.maxItemsCarrito) {
@@ -1571,6 +1607,12 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
       if (!items || items.length === 0) {
         return { exito: false, error: 'El carrito está vacío. Agrega productos primero.' };
       }
+      // Tope de pedidos por día: cada pedido avisa al celular de todo el equipo de Redes, y
+      // un cliente (o el modelo, engañado) podía confirmar sin fin. Ver negocio.json.
+      if (negocio.maxPedidosDiarios > 0 && (await db.contarPedidosRecientes(telefono)) >= negocio.maxPedidosDiarios) {
+        alertar('Cliente superó el tope de pedidos diarios', `${telefono}: intentó confirmar otro pedido. No se creó tarjeta; revisar la conversación.`);
+        return { exito: false, error: "Este cliente ya confirmó varios pedidos en las últimas 24 horas. NO se registró uno nuevo. Dile con amabilidad que un asesor lo va a contactar para revisar todo su pedido junto, y no vuelvas a llamar confirmar_pedido." };
+      }
       let total = 0;
       const resumenItems = items.map((item, i) => {
         const cant = item.cantidad || 1;
@@ -1592,7 +1634,10 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
       await db.limpiarCarrito(from);
       await db.limpiarFlujosEnCurso(from);
       evento(telefono, 'pedido', `$${total.toLocaleString('es-CO')}`);
-      notificarRedes(telefono, resumenItems.join('\n'), historial, 'pedido', { carrito: items });
+      // Ciudad y forma de pago, si las dio: el asesor sabe de una vez si el envío es gratis
+      // y si aplica el descuento (efectivo/transferencia).
+      const datosCierre = [args.ciudad && `Entrega en: ${String(args.ciudad).slice(0, 80)}`, args.forma_pago && `Pago: ${String(args.forma_pago).slice(0, 40)}`].filter(Boolean).join(' · ');
+      notificarRedes(telefono, resumenItems.join('\n') + (datosCierre ? `\n${datosCierre}` : ''), historial, 'pedido', { carrito: items });
       // Mensaje de confirmación con resumen exacto — el campo 'mensaje_enviado' le indica a la IA que no lo repita
       const avisoHorarioPedido = avisoFueraHorario();
       return {
@@ -1628,19 +1673,24 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
 
     case 'enviar_catalogo': {
       const { categoria } = args;
-      const catNorm = normalizarTexto(categoria).replace(/\s+/g, '_');
-      const url = catalogosDB[catNorm] ?? catalogosDB[categoria];
-      if (!url) {
-        // Primero buscar por prefijo exacto, luego por substring (evita confundir sofas con sofas_modulares)
-        const entrada = Object.entries(catalogosDB).find(([k]) => k === catNorm)
-          ?? Object.entries(catalogosDB).find(([k]) => k.startsWith(catNorm) || catNorm.startsWith(k));
-        if (entrada) return { exito: true, url: entrada[1], categoria: entrada[0] };
+      // PDF de Herramientas → catálogo visual → página de la sección del inventario. La
+      // última existe para toda categoría con productos activos (p. ej. cunas, que no
+      // tiene PDF), así que el cliente ya no se queda sin catálogo.
+      const encontrado = catalogos.resolver(categoria);
+      if (!encontrado) {
+        const hay = catalogos.disponibles();
         return {
           exito: false,
-          error: `No hay catálogo PDF para "${categoria}". Puedo mostrarte los productos en texto usando buscar_productos.`
+          error: `No hay un catálogo que sea exactamente de "${categoria}".${hay.length ? ` Los que sí hay: ${hay.join(', ')}. Si lo que pidió es ambiguo, pregúntale cuál de esos quiere; si no se vende, díselo con amabilidad y ofrécele buscar_productos.` : ' Ofrécele buscar_productos.'}`
         };
       }
-      return { exito: true, url, categoria };
+      evento(telefono, 'catalogo', `${encontrado.fuente}: ${encontrado.nombre}`);
+      return {
+        exito: true,
+        url: encontrado.url,
+        categoria: encontrado.nombre,
+        ...(encontrado.fuente === 'inventario' && { nota: 'Es la página en línea de esa categoría, con fotos y precios actualizados. Preséntalo así (no como un PDF).' }),
+      };
     }
 
     case 'agendar_cita': {
@@ -1655,7 +1705,7 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
       // Antes bastaba con que apareciera la palabra "martes" en el texto, y el asesor
       // recibía citas como "martes 3 de junio de 2026" (que es miércoles) sin saber a
       // cuál de los dos días atenerse.
-      const val = fechas.validarFechaHoraCita(dia, hora);
+      const val = fechas.validarFechaHoraCita(dia, hora, { cerradoEnFestivos: negocio.cerradoEnFestivos });
       if (!val.ok) return { exito: false, error: val.error };
 
       const horaFormateada = val.hora;
@@ -1996,7 +2046,7 @@ async function runAgentLoop(from, mensajeUsuario, opciones = {}) {
     // cada turno con foto: el caché no llegaba a usarse nunca.
     { role: 'system', content: buildSystemPrompt() },
     ...(instruccionesExtra ? [{ role: 'system', content: instruccionesExtra }] : []),
-    { role: 'system', content: fechas.bloqueFechaParaPrompt() },
+    { role: 'system', content: fechas.bloqueFechaParaPrompt(new Date(), { cerradoEnFestivos: negocio.cerradoEnFestivos }) },
     ...(notaReactivacion ? [{ role: 'system', content: notaReactivacion }] : []),
     ...(notaRegreso ? [{ role: 'system', content: notaRegreso }] : []),
     ...(contextoPerfil ? [{ role: 'system', content: contextoPerfil }] : []),
@@ -2557,9 +2607,9 @@ app.get('/webhook', (req, res) => {
 // ya usa el agente frente al sistema de ventas (header X-Agent-Token o ?token=). Sin
 // token configurado se rechaza todo: mejor un 401 que exponer datos por defecto.
 function requireAgentToken(req, res, next) {
-  const token = process.env.DECASA_AGENT_TOKEN;
-  const dado  = req.headers['x-agent-token'] ?? req.query.token;
-  if (!token || dado !== token) return res.status(401).json({ error: 'no autorizado' });
+  const dado = req.headers['x-agent-token'] ?? req.query.token;
+  // Comparación de tiempo constante (seguridad.js): la normal filtra el token por tiempos.
+  if (!seguridad.tokenValido(dado, process.env.DECASA_AGENT_TOKEN)) return res.status(401).json({ error: 'no autorizado' });
   next();
 }
 
@@ -2567,7 +2617,7 @@ app.post('/refresh-inventario', requireAgentToken, async (req, res) => {
   await cargarInventario();
   await cargarCatalogos();
   sincronizarHashesCatalogo().catch(e => console.error('[hash-imagen] error:', e.message));
-  res.json({ status: 'ok', categorias: Object.keys(inventario).length, catalogos: Object.keys(catalogosDB).length });
+  res.json({ status: 'ok', categorias: Object.keys(inventario).length, catalogos: catalogos.cuantos() });
 });
 
 // Métricas de negocio: el embudo del agente. Mismo formato que /stats del agente de
@@ -2634,7 +2684,7 @@ app.get('/health', async (req, res) => {
     comprobaciones,
     usuarios, pedidos, citas,
     categorias: Object.keys(inventario).length,
-    catalogos: Object.keys(catalogosDB).length,
+    catalogos: catalogos.cuantos(),
     modelo: MODEL
   });
 });
@@ -2687,14 +2737,13 @@ function revisarSeguridad() {
   }
 }
 
-async function revisarContratoBD() {
-  const { faltantes, error } = await verificarContrato(db.pool);
-  if (error) return console.warn('[contrato-bd] no se pudo verificar:', error);
-  if (faltantes.length === 0) return console.log('[contrato-bd] ✅ esquema del sistema de ventas compatible');
-  const detalle = describirFaltantes(faltantes);
-  console.error('[contrato-bd] ❌ faltan:', detalle);
-  alertar('El sistema de ventas cambió columnas que usa el agente', `Faltan: ${detalle}. Revisar la última migración de decasa-api y contrato-bd.js.`);
-}
+// Revisión de lo que el agente toma del sistema de ventas (contrato-bd.js): columnas,
+// sedes abiertas (una tienda cerrada deja de ofrecerse para citas) y categorías nuevas
+// del inventario. Al arrancar —después de cargar los catálogos, que traen las
+// categorías— y cada hora. Avisa una sola vez por cambio.
+const revisarSistemaDeVentas = crearRevisionSistema({
+  pool: db.pool, negocio, alertar, secciones: () => catalogos.estado.secciones,
+});
 
 async function startServer() {
   console.log(`[SERVER] 🔵 Iniciando ${negocio.nombreAsesora} - ${negocio.nombreEmpresa}...`);
@@ -2705,10 +2754,6 @@ async function startServer() {
   } catch (err) {
     console.error('[SERVER] ❌ Error BD:', err.message);
   }
-  // Contrato con el sistema de ventas (contrato-bd.js): si una migración de decasa-api
-  // renombró o quitó algo que el agente lee, se avisa al arrancar y no cuando un cliente
-  // reciba un precio o una foto equivocados.
-  await revisarContratoBD();
 
   const refrescarInventarioYHashes = async () => {
     await cargarInventario();
@@ -2716,10 +2761,14 @@ async function startServer() {
   };
   await refrescarInventarioYHashes();
   await cargarCatalogos();
+  await revisarSistemaDeVentas().catch(e => console.error('[contrato-bd] revisión:', e.message));
   setInterval(() => {
     refrescarInventarioYHashes().catch(e => console.error('[INVENTARIO] error refrescando:', e.message));
   }, 30 * 60 * 1000);
-  setInterval(cargarCatalogos, 60 * 60 * 1000); // Catálogos cada hora
+  setInterval(async () => {   // Catálogos y revisión del sistema de ventas cada hora
+    await cargarCatalogos();
+    await revisarSistemaDeVentas().catch(e => console.error('[contrato-bd] revisión:', e.message));
+  }, 60 * 60 * 1000);
 
   const server = app.listen(PORT, () => {
     console.log(`[SERVER] ✅ Puerto ${PORT} | Modelo: ${MODEL}`);
@@ -2736,6 +2785,7 @@ async function startServer() {
   setInterval(() => {
     db.limpiarHistorialAntiguo().catch(e => console.error('[DB] limpieza historial:', e.message));
     db.limpiarSidsAntiguos().catch(e => console.error('[DB] limpieza sids:', e.message));
+    db.limpiarGastoAntiguo().catch(e => console.error('[DB] limpieza gasto:', e.message));
   }, 24 * 60 * 60 * 1000);
 
   // Worker de la cola de notificaciones al sistema de ventas: reintenta lo que no se
@@ -2786,6 +2836,8 @@ module.exports = {
   recibirMensaje, procesarMensaje, encolar, trocearTexto, DEBOUNCE_MS,
   // Expuestos para pruebas de la notificación al sistema de ventas (idempotencia).
   notificarRedes, procesarColaNotificaciones,
+  // Expuesto para pruebas de las herramientas (p. ej. consultar_pedidos).
+  ejecutarHerramienta,
   // Expuestos para pruebas de variantes de precio.
   cargarInventario, infoPrecioVariantes, precioMinimo, encontrarVariante, recalcularPreciosInventario,
   buscarImagenProducto, buscarEnInventario,

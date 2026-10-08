@@ -1,3 +1,5 @@
+> **Obsoleto** — borrador inicial que no describe el agente actual. Ver el AGENT.md de la raíz de `Agentes/`.
+
 ## Skills del agente
 
 ## skill: responder_preguntas

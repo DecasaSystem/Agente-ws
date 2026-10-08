@@ -19,10 +19,29 @@ describe('analizarVariantes', () => {
     expect(a.combinaTipos).toBe(false);
   });
 
-  test('un tipo marcado afecta_precio = 0 nunca decide el precio', () => {
-    const a = analizarVariantes({ variantes: [v('Rojo', 900000, 'Mantel', { afectaPrecio: false })] });
+  test('"Solo diferencia" sin precio cargado no decide el precio', () => {
+    const a = analizarVariantes({ variantes: [v('Rojo', 900000, 'Mantel', { afectaPrecio: false, precioPropio: false })] });
     expect(a.dePrecio).toEqual([]);
     expect(a.cosmeticas).toHaveLength(1);
+  });
+
+  test('lo que cobra el sistema manda: con precio cargado cuenta aunque el tipo diga "Solo diferencia"', () => {
+    // Nueva orden suma el precio_adicional sin mirar afecta_precio.
+    const a = analizarVariantes({ variantes: [v('Eléctrica', 2980000, 'Mecanismo', { afectaPrecio: false, precioPropio: true })] });
+    expect(a.dePrecio).toHaveLength(1);
+  });
+
+  test('silla reclinable: Manual (palanca, precio base) y Eléctrica (botón, su precio)', () => {
+    const silla = { precio: 2580000, variantes: [
+      v('Manual', 2580000, 'Mecanismo', { precioPropio: false }), // precio_adicional 0 → base
+      v('Eléctrica', 2980000, 'Mecanismo'),
+      v('Gris', 2580000, 'Color', { afectaPrecio: false, precioPropio: false }),
+    ] };
+    const a = analizarVariantes(silla);
+    expect(a.tiposDePrecio).toEqual(['Mecanismo']);
+    expect(a.dePrecio.map(x => [x.etiqueta, x.precio])).toEqual([['Manual', 2580000], ['Eléctrica', 2980000]]);
+    expect(a.cosmeticas.map(x => x.etiqueta)).toEqual(['Gris']);
+    expect(a.combinaTipos).toBe(false);
   });
 
   test('dos tipos con precio propio: combina (lo cotiza un asesor)', () => {
@@ -53,4 +72,45 @@ describe('precioMinimoCombinado: la combinación más barata, como la suma el si
     // 1.40 + 4 pts = 0 + 0 → base 1.500.000; 1.40 + 6 pts = 500.000 (la más barata)
     expect(precioMinimoCombinado(p, 1500000)).toBe(500000);
   });
+});
+
+describe('infoVentaPorJuego: productos que se venden de a N', () => {
+  const { infoVentaPorJuego } = require('../../precio-variantes');
+
+  test('por unidad: nada que aclarar', () => {
+    expect(infoVentaPorJuego({ piezasPorJuego: null }, 500000)).toBeNull();
+    expect(infoVentaPorJuego({ piezasPorJuego: 1 }, 500000)).toBeNull();
+  });
+
+  test('en juego: el precio es del juego y la pieza suelta tiene el suyo', () => {
+    const r = infoVentaPorJuego({ piezasPorJuego: 2, precioPieza: 450000 }, 800000);
+    expect(r.piezas_por_juego).toBe(2);
+    expect(r.precio_pieza_suelta).toBe(450000);
+    expect(r.nota_juego).toMatch(/juego de 2/);
+  });
+
+  test('sin precio de pieza: el juego entre N, como en el sistema de ventas', () => {
+    expect(infoVentaPorJuego({ piezasPorJuego: 2, precioPieza: null }, 800000).precio_pieza_suelta).toBe(400000);
+  });
+
+  test('con variantes de precio la pieza suelta la confirma un asesor', () => {
+    const p = { piezasPorJuego: 2, variantes: [
+      { etiqueta: 'Natural', precio: 800000, tipo: 'Acabado', afectaPrecio: true, precioPropio: true },
+      { etiqueta: 'Wengué', precio: 900000, tipo: 'Acabado', afectaPrecio: true, precioPropio: true },
+    ] };
+    const r = infoVentaPorJuego(p, 800000);
+    expect(r.precio_pieza_suelta).toBeUndefined();
+    expect(r.nota_juego).toMatch(/asesor/);
+  });
+});
+
+test('infoVentaPorJuego: una opción con su propio número de piezas se avisa', () => {
+  const { infoVentaPorJuego } = require('../../precio-variantes');
+  const p = { piezasPorJuego: 4, variantes: [
+    { etiqueta: '4 pts', precio: 1200000, tipo: 'Puestos', afectaPrecio: true, precioPropio: true },
+    { etiqueta: '6 pts', precio: 1700000, tipo: 'Puestos', afectaPrecio: true, precioPropio: true, piezasPorJuego: 6 },
+  ] };
+  const r = infoVentaPorJuego(p, 1200000);
+  expect(r.piezas_por_opcion).toEqual(['6 pts: juego de 6']);
+  expect(r.nota_juego).toMatch(/otro número/);
 });

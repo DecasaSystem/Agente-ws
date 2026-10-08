@@ -1020,6 +1020,22 @@ async function getGastoHoy(telefono) {
   }
 }
 
+// Pedidos que confirmó el cliente en las últimas horas (eventos 'pedido'): sirve para el
+// tope de pedidos por día (negocio.json → operacion.maxPedidosDiarios).
+async function contarPedidosRecientes(telefono, horas = 24) {
+  try {
+    const [rows] = await pool.query(
+      "SELECT COUNT(*) AS n FROM wa_eventos WHERE telefono = ? AND tipo = 'pedido' AND created_at > NOW() - INTERVAL ? HOUR",
+      [String(telefono).replace('whatsapp:', ''), horas]
+    );
+    return Number(rows[0]?.n ?? 0);
+  } catch (e) {
+    // Ante la duda no se bloquea una venta.
+    console.warn('[pedidos] no se pudieron contar:', e.message);
+    return 0;
+  }
+}
+
 async function limpiarGastoAntiguo(dias = 60) {
   try {
     await pool.query('DELETE FROM wa_gasto_diario WHERE dia < DATE_SUB(CURDATE(), INTERVAL ? DAY)', [dias]);
@@ -1313,6 +1329,7 @@ module.exports = {
   registrarGasto,
   getGastoHoy,
   limpiarGastoAntiguo,
+  contarPedidosRecientes,
   getPerfil,
   setPerfil,
   getResumenConversacion,
@@ -1421,7 +1438,10 @@ async function getInventarioFromDB() {
               foto_url    AS imagen,
               foto_url_2  AS imagen2,
               medidas, material,
-              categoria   AS subcategoria
+              categoria   AS subcategoria,
+              descripcion,
+              piezas_por_juego AS piezasPorJuego,
+              precio_pieza     AS precioPieza
        FROM productos
        WHERE activo = 1
        ORDER BY categoria, nombre`
@@ -1450,6 +1470,10 @@ async function getInventarioFromDB() {
       material: row.material || '',
       precio:   formatearPrecioFromDB(row.precio),
       imagen:   row.imagen || '',
+      descripcion: row.descripcion || '',
+      // Venta por juego (ver precio-variantes.js → infoVentaPorJuego).
+      piezasPorJuego: row.piezasPorJuego ?? null,
+      precioPieza:    row.precioPieza ?? null,
       variantes: variantesPorProducto.get(row.id) ?? []
     });
   }
@@ -1524,6 +1548,25 @@ async function getVariantesPorProducto() {
     // De menor a mayor precio: al cliente se le muestra "desde X" y así la lista queda
     // en el orden en que la va a leer.
     for (const lista of mapa.values()) lista.sort((a, b) => a.precio - b.precio);
+
+    // Piezas del juego por OPCIÓN (migración piezas_por_juego_por_opcion, 2026-10-08): una
+    // opción puede ser "juego de 6" aunque el producto sea de 4. Va en una consulta
+    // APARTE a propósito: si la columna no existe todavía, la de arriba —la de los
+    // precios— no puede caerse con ella.
+    try {
+      const [piezas] = await pool.query(`
+        SELECT cfg.producto_id, o.nombre AS etiqueta, cfg.piezas_por_juego AS piezas
+        FROM producto_variante_configs cfg
+        JOIN tipo_variante_opciones o ON o.id = cfg.opcion_id
+        WHERE cfg.piezas_por_juego > 1
+      `);
+      for (const p of piezas) {
+        const v = (mapa.get(p.producto_id) ?? []).find(x => x.etiqueta === String(p.etiqueta ?? '').trim());
+        if (v) v.piezasPorJuego = Number(p.piezas);
+      }
+    } catch {
+      // Sin la columna: cada opción usa las piezas del producto.
+    }
   } catch (e) {
     // Si las tablas de variantes no existen (BD antigua), se sigue con precio único.
     console.warn('[VARIANTES] no se pudieron cargar:', e.message);

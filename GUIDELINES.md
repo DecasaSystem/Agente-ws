@@ -1,5 +1,10 @@
 # Guidelines para modificar el agente DeCasa
 
+> **Vigente: `../AGENT.md` (AGENT.md de la raíz de `Agentes/`).** Este archivo es historia: las
+> reglas generales siguen valiendo, pero lo de Gemini (`callGemini`) y los "bugs pendientes"
+> son de una versión anterior (hoy todo es OpenAI). Si algo choca, manda el AGENT.md de la raíz.
+
+
 ## Reglas generales
 
 1. **NO eliminar código existente a menos que sea absolutamente necesario** — fijarse que no se duplique código al añadir algo

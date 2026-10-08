@@ -9,6 +9,11 @@ cloudinary.config({
 });
 
 async function downloadFromTwilio(mediaUrl) {
+  // Las credenciales de la cuenta solo viajan a Twilio: una URL ajena en MediaUrl0 se las
+  // habría llevado (ver seguridad.js).
+  if (!require('./seguridad').esUrlDeTwilio(mediaUrl)) {
+    throw new Error('URL de media que no es de Twilio: no se descarga');
+  }
   const auth = Buffer.from(
     process.env.TWILIO_ACCOUNT_SID + ':' + process.env.TWILIO_AUTH_TOKEN
   ).toString('base64');
