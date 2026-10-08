@@ -178,7 +178,7 @@ describe('Cliente transferido a un asesor', () => {
     db.estaTransferida.mockResolvedValue(false);
     db.asesorAtendiendo.mockResolvedValue(true);
     mockOpenAICreate
-      .mockResolvedValueOnce(respuestaConTool('transferir_asesor', { motivo: 'quiere precio especial', tipo: 'asesor' }))
+      .mockResolvedValueOnce(respuestaConTool('transferir_asesor', { motivo: 'quiere precio especial', tipo: 'asesor', nombre: 'Laura Gómez', telefono_contacto: 'este_mismo' }))
       .mockResolvedValueOnce(respuestaSimple('Te conecto con un asesor 😊'));
     const from = 'whatsapp:+573003030303';
 
@@ -198,7 +198,7 @@ describe('Transferencia fuera de horario', () => {
     jest.setSystemTime(NOCHE);
     db.solicitudAsesorPendiente.mockResolvedValue(false);
     mockOpenAICreate
-      .mockResolvedValueOnce(respuestaConTool('transferir_asesor', { razon: 'Quiere el costo de envío a Cali' }))
+      .mockResolvedValueOnce(respuestaConTool('transferir_asesor', { razon: 'Quiere el costo de envío a Cali', nombre: 'Laura Gómez', telefono_contacto: 'este_mismo' }))
       .mockResolvedValue(respuestaSimple('Un asesor te escribe mañana a partir de las 8am 😊 Mientras tanto te sigo ayudando'));
 
     recibirMensaje({ from: 'whatsapp:+573004040404', toNumber: TO, texto: 'cuánto vale el envío a cali?' });
@@ -223,7 +223,7 @@ describe('Transferencia fuera de horario', () => {
     jest.setSystemTime(new Date('2026-09-15T21:40:00Z')); // martes 16:40 Bogotá
     db.solicitudAsesorPendiente.mockResolvedValue(false);
     mockOpenAICreate
-      .mockResolvedValueOnce(respuestaConTool('transferir_asesor', { razon: 'Pregunta por garantía' }))
+      .mockResolvedValueOnce(respuestaConTool('transferir_asesor', { razon: 'Pregunta por garantía', nombre: 'Laura Gómez', telefono_contacto: 'este_mismo' }))
       .mockResolvedValue(respuestaSimple('Mañana te escribe un asesor 😊'));
 
     recibirMensaje({ from: 'whatsapp:+573005050505', toNumber: TO, texto: 'garantía?' });
@@ -235,7 +235,7 @@ describe('Transferencia fuera de horario', () => {
   test('a las 4:39 pm todavía transfiere en el momento', async () => {
     jest.setSystemTime(new Date('2026-09-15T21:39:00Z')); // martes 16:39 Bogotá
     mockOpenAICreate
-      .mockResolvedValueOnce(respuestaConTool('transferir_asesor', { razon: 'Pregunta por garantía' }))
+      .mockResolvedValueOnce(respuestaConTool('transferir_asesor', { razon: 'Pregunta por garantía', nombre: 'Laura Gómez', telefono_contacto: 'este_mismo' }))
       .mockResolvedValue(respuestaSimple('Te conecto con un asesor 😊'));
 
     recibirMensaje({ from: 'whatsapp:+573006060606', toNumber: TO, texto: 'garantía?' });
@@ -248,7 +248,7 @@ describe('Transferencia fuera de horario', () => {
     jest.setSystemTime(NOCHE);
     db.solicitudAsesorPendiente.mockResolvedValue(true);
     mockOpenAICreate
-      .mockResolvedValueOnce(respuestaConTool('transferir_asesor', { razon: 'Insiste en hablar con asesor' }))
+      .mockResolvedValueOnce(respuestaConTool('transferir_asesor', { razon: 'Insiste en hablar con asesor', nombre: 'Laura Gómez', telefono_contacto: 'este_mismo' }))
       .mockResolvedValue(respuestaSimple('Ya quedó registrado, mañana te escriben 😊'));
 
     recibirMensaje({ from: 'whatsapp:+573007070707', toNumber: TO, texto: 'y el asesor?' });
@@ -265,7 +265,7 @@ describe('Cola durable de notificaciones', () => {
   test('si el sistema de ventas falla, la notificación se encola en vez de perderse', async () => {
     mockFetchWithRetry.mockRejectedValue(new Error('ECONNREFUSED'));
     mockOpenAICreate
-      .mockResolvedValueOnce(respuestaConTool('transferir_asesor', { razon: 'Quiere confirmar disponibilidad de Cama Lisboa' }))
+      .mockResolvedValueOnce(respuestaConTool('transferir_asesor', { razon: 'Quiere confirmar disponibilidad de Cama Lisboa', nombre: 'Laura Gómez', telefono_contacto: 'este_mismo' }))
       .mockResolvedValue(respuestaSimple('Un asesor te contacta enseguida 😊'));
 
     recibirMensaje({ from: 'whatsapp:+573001234567', toNumber: TO, texto: 'quiero hablar con un asesor' });
@@ -280,7 +280,7 @@ describe('Cola durable de notificaciones', () => {
 
   test('si el envío funciona, no se encola nada', async () => {
     mockOpenAICreate
-      .mockResolvedValueOnce(respuestaConTool('transferir_asesor', { razon: 'Pregunta por garantía' }))
+      .mockResolvedValueOnce(respuestaConTool('transferir_asesor', { razon: 'Pregunta por garantía', nombre: 'Laura Gómez', telefono_contacto: 'este_mismo' }))
       .mockResolvedValue(respuestaSimple('Ya te contacto un asesor 😊'));
 
     recibirMensaje({ from: 'whatsapp:+573001234567', toNumber: TO, texto: 'necesito un asesor' });
@@ -296,7 +296,7 @@ describe('Tipo de transferencia', () => {
     mockOpenAICreate
       .mockResolvedValueOnce(respuestaConTool('transferir_asesor', {
         razon: 'Quiere que le fabriquen una cama de 2 metros en color nogal',
-        tipo: 'personalizacion',
+        tipo: 'personalizacion', nombre: 'Laura Gómez', telefono_contacto: 'este_mismo',
       }))
       .mockResolvedValue(respuestaSimple('Un asesor te cotiza eso enseguida 😊'));
 
@@ -310,7 +310,7 @@ describe('Tipo de transferencia', () => {
 
   test('sin tipo explícito se trata como solicitud de asesor', async () => {
     mockOpenAICreate
-      .mockResolvedValueOnce(respuestaConTool('transferir_asesor', { razon: 'Pregunta por la garantía' }))
+      .mockResolvedValueOnce(respuestaConTool('transferir_asesor', { razon: 'Pregunta por la garantía', nombre: 'Laura Gómez', telefono_contacto: 'este_mismo' }))
       .mockResolvedValue(respuestaSimple('Te contacto un asesor 😊'));
 
     recibirMensaje({ from: 'whatsapp:+573001234567', toNumber: TO, texto: 'garantía?' });
@@ -385,10 +385,12 @@ describe('Nombre del cliente (ProfileName de Twilio)', () => {
     expect(db.getOrCreateUsuario).toHaveBeenCalledWith(from, 'Ana María');
   });
 
+  // Desde 2026-10-08 manda el nombre que da el cliente; el de su perfil de WhatsApp es el
+  // respaldo cuando no quiso dar datos.
   test('la notificacion al panel lleva el nombre, no solo el numero', async () => {
     db.getNombreCliente.mockResolvedValue('Ana María');
     mockOpenAICreate
-      .mockResolvedValueOnce(respuestaConTool('transferir_asesor', { razon: 'Quiere ver la cama Lisboa' }))
+      .mockResolvedValueOnce(respuestaConTool('transferir_asesor', { razon: 'Quiere ver la cama Lisboa', cliente_no_quiso_dar_datos: true }))
       .mockResolvedValue(respuestaSimple('Un asesor te escribe 😊'));
 
     recibirMensaje({ from: 'whatsapp:+573009990000', toNumber: TO, texto: 'un asesor por favor', profileName: 'Ana María' });
@@ -401,7 +403,7 @@ describe('Nombre del cliente (ProfileName de Twilio)', () => {
   test('sin ProfileName la notificacion sigue saliendo', async () => {
     db.getNombreCliente.mockResolvedValue(null);
     mockOpenAICreate
-      .mockResolvedValueOnce(respuestaConTool('transferir_asesor', { razon: 'Pregunta por garantia' }))
+      .mockResolvedValueOnce(respuestaConTool('transferir_asesor', { razon: 'Pregunta por garantia', cliente_no_quiso_dar_datos: true }))
       .mockResolvedValue(respuestaSimple('Listo 😊'));
 
     recibirMensaje({ from: 'whatsapp:+573001112222', toNumber: TO, texto: 'asesor' });

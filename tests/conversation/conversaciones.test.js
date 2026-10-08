@@ -179,7 +179,7 @@ describe('Compra completa', () => {
 
     // Turno 5: confirma el pedido
     limpiarEnviados();
-    guion(tool('confirmar_pedido'), texto('¡Gracias por tu compra! 🎉'));
+    guion(tool('confirmar_pedido', { nombre: 'Laura Gómez', telefono_contacto: 'este_mismo' }), texto('¡Gracias por tu compra! 🎉'));
     await cliente('confirmo la compra');
 
     expect(db._estado.pedidos).toHaveLength(1);
@@ -303,7 +303,7 @@ describe('Transferencia a un asesor', () => {
   test('fuera de horario la solicitud queda registrada y la IA sigue atendiendo', async () => {
     jest.setSystemTime(new Date('2026-09-15T23:30:00Z')); // martes 6:30 pm Bogotá, ya cerrado
 
-    guion(tool('transferir_asesor', { razon: 'Quiere cotizar a medida' }), texto('Un asesor te escribe mañana; mientras tanto sigo aquí 😊'));
+    guion(tool('transferir_asesor', { razon: 'Quiere cotizar a medida', nombre: 'Laura Gómez', telefono_contacto: 'este_mismo' }), texto('Un asesor te escribe mañana; mientras tanto sigo aquí 😊'));
     await cliente('quiero hablar con un asesor');
 
     const res = resultadosDeHerramientas().find(r => r.fuera_de_horario);
@@ -318,7 +318,7 @@ describe('Transferencia a un asesor', () => {
   });
 
   test('en horario, la IA calla hasta que el asesor termine', async () => {
-    guion(tool('transferir_asesor', { razon: 'Pregunta por garantía' }), texto('Te conecto con un asesor 😊'));
+    guion(tool('transferir_asesor', { razon: 'Pregunta por garantía', nombre: 'Laura Gómez', telefono_contacto: 'este_mismo' }), texto('Te conecto con un asesor 😊'));
     await cliente('necesito un asesor');
     expect(await db.estaTransferida(FROM)).toBe(true);
 

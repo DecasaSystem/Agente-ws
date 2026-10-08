@@ -78,6 +78,7 @@ const { construirSystemPrompt } = require('./prompt');
 const vigilancia = require('./vigilancia');
 const seguimientos = require('./seguimientos');
 const memoria = require('./memoria');
+const contacto = require('./contacto');
 const log = require('./log');
 const { conReintentos } = reintentos;
 
@@ -551,6 +552,23 @@ async function enviarNotificacionTelegram(telefono, mensaje, historial, tipo = '
     ...(extra.tienda_id  && { tienda_id:  extra.tienda_id }),
   };
 
+  // Lo que se sabe del cliente viaja en `contacto`: con eso el sistema de ventas arma su
+  // ficha en Clientes → Redes. Si quien llama no lo armó (citas, objeciones, avisos
+  // automáticos), sale del perfil guardado. Un sistema de ventas viejo lo ignora.
+  let datosContacto = extra.contacto ?? null;
+  if (!datosContacto) {
+    try {
+      const perfil = await db.getPerfil(telefono);
+      datosContacto = contacto.payloadContacto(
+        { nombre: contacto.limpiarNombre(extra.nombre || perfil?.nombre), telefono: contacto.normalizarTelefono(perfil?.telefono_contacto) },
+        perfil,
+        { ciudad: perfil?.ciudad },
+      );
+    } catch { /* sin perfil, la tarjeta sale igual */ }
+  }
+  if (datosContacto) payload.contacto = datosContacto;
+  if (datosContacto?.nombre) payload.nombre_cliente = datosContacto.nombre;
+
   // El error se PROPAGA a propósito: quien llama (notificarRedes) lo necesita para
   // encolar el reintento. Si se tragara aquí, un fallo de la API haría desaparecer la
   // solicitud del asesor sin que nadie se entere.
@@ -769,6 +787,34 @@ function infoPrecioVariantes(p) {
     nota_variantes: 'Este producto tiene varias opciones con PRECIOS DISTINTOS. No des un precio único ni menciones solo el más bajo como si fuera el precio: dile el rango (desde X hasta Y), enumera las opciones disponibles y pregúntale cuál necesita. Cuando la elija, dale el precio exacto de ESA opción.',
     ...otrasOpciones,
   };
+}
+
+// Agrega a la info de precio lo que pagaría con el descuento por efectivo/transferencia
+// (5 %, ver negocio.json). La cuenta la hace el código: Elena solo repite la cifra, y como
+// sale de una herramienta, validarPrecios la reconoce como precio válido. Los productos
+// cuyo precio depende de una combinación de opciones no lo llevan: ese precio lo da un asesor.
+function conPrecioEfectivo(info) {
+  if (!negocio.porcentajeDescuentoEfectivo || info.precio_requiere_asesor) return info;
+  if (info.precio) {
+    const efectivo = negocio.conDescuentoEfectivo(parsearPrecio(info.precio));
+    return efectivo ? { ...info, precio_pagando_efectivo: formatearMoneda(efectivo) } : info;
+  }
+  if (Array.isArray(info.variantes)) {
+    return {
+      ...info,
+      variantes: info.variantes.map(v => {
+        const efectivo = negocio.conDescuentoEfectivo(Number(v.precio));
+        return efectivo ? { ...v, precio_pagando_efectivo: efectivo } : v;
+      }),
+    };
+  }
+  return info;
+}
+
+// Total del carrito con el descuento por forma de pago, ya formateado (o nada).
+function totalConDescuento(total) {
+  const efectivo = negocio.conDescuentoEfectivo(total);
+  return efectivo ? { total_con_descuento_efectivo: formatearMoneda(efectivo), porcentaje_descuento_efectivo: negocio.porcentajeDescuentoEfectivo } : {};
 }
 
 // Precio con el que comparar contra el presupuesto del cliente: el más bajo al que
@@ -1011,6 +1057,15 @@ function buildSystemPrompt() {
 
 // ─── TOOL DEFINITIONS ────────────────────────────────────────────────────────
 
+// Datos de contacto que se piden antes de pasar al cliente con una persona (transferencia
+// y pedido). Ver contacto.js: si faltan, la herramienta no transfiere y le pide a Elena
+// que los pregunte; si el cliente no quiere darlos, se transfiere igual.
+const PARAMS_CONTACTO = {
+  nombre:            { type: 'string', description: 'Nombre de la persona, tal como lo dijo (sin "me llamo")' },
+  telefono_contacto: { type: 'string', description: 'Celular para que el asesor lo contacte. Si el cliente confirma que es este mismo número de WhatsApp, pasa "este_mismo".' },
+  cliente_no_quiso_dar_datos: { type: 'boolean', description: 'true SOLO si se los pediste y el cliente no quiso darlos' },
+};
+
 const TOOLS = [
   {
     type: 'function',
@@ -1119,6 +1174,7 @@ const TOOLS = [
         properties: {
           ciudad:     { type: 'string', description: 'Ciudad o municipio de entrega, si el cliente la dijo (decide si el envío es gratis). Omítelo si no la dio.' },
           forma_pago: { type: 'string', description: 'Cómo quiere pagar, si lo dijo: efectivo, transferencia, tarjeta o ADDI (decide si aplica el descuento). Omítelo si no lo dijo.' },
+          ...PARAMS_CONTACTO,
         }
       }
     }
@@ -1198,7 +1254,7 @@ const TOOLS = [
     type: 'function',
     function: {
       name: 'transferir_asesor',
-      description: 'Transfiere al cliente con un asesor humano cuando lo solicite o cuando no puedas resolver su consulta.',
+      description: 'Transfiere al cliente con un asesor humano cuando lo solicite o cuando no puedas resolver su consulta. Antes necesitas su nombre y un celular de contacto (ver DATOS ANTES DE TRANSFERIR).',
       parameters: {
         type: 'object',
         properties: {
@@ -1207,7 +1263,8 @@ const TOOLS = [
             type: 'string',
             enum: ['asesor', 'personalizacion'],
             description: "Usa 'personalizacion' cuando el cliente quiere un mueble a la medida, un color o acabado especial, o una restauración/reparación. Para todo lo demás usa 'asesor'."
-          }
+          },
+          ...PARAMS_CONTACTO,
         },
         required: ['razon']
       }
@@ -1314,6 +1371,39 @@ async function construirContextoMostrados(from) {
   } catch { return null; }
 }
 
+// Antes de pasar al cliente con una persona (transferencia o pedido) se necesitan su
+// nombre y un celular (dueño, 2026-10-08). Devuelve { contacto } listo para usar, o
+// { respuesta } con lo que hay que decirle a Elena si faltan datos. Lo que se consiga se
+// guarda en el perfil para que una segunda transferencia no vuelva a preguntarlo.
+// El cliente avanzó (carrito, pedido, cita, asesor): el "¿pudiste pensarlo?" de mañana ya
+// no tiene sentido.
+function cancelarInteresPendiente(telefono) {
+  seguimientos.cancelar(depsSeguimientos(), { destinatario: telefono, tipo: seguimientos.TIPOS.INTERES_PENDIENTE }).catch(() => {});
+}
+
+async function resolverContactoParaAsesor(from, args, herramienta) {
+  const telefono = from.replace('whatsapp:', '');
+  let perfil = null;
+  try { perfil = await db.getPerfil(from); } catch { /* sin perfil se pide todo */ }
+  const datos = contacto.resolverContacto({ canal: 'whatsapp', args, perfil, telefonoCanal: telefono });
+  if (datos.faltan.length && !datos.negado) {
+    evento(telefono, 'contacto_pedido', datos.faltan.join(','));
+    return {
+      respuesta: {
+        exito: false,
+        faltan_datos: datos.faltan,
+        instruccion: contacto.instruccionPedirDatos({ canal: 'whatsapp', faltan: datos.faltan, herramienta }),
+      },
+    };
+  }
+  const cambios = {};
+  if (datos.nombre) cambios.nombre = datos.nombre;
+  if (datos.telefono) cambios.telefono_contacto = datos.telefono;
+  if (args.ciudad) cambios.ciudad = args.ciudad;
+  if (Object.keys(cambios).length) await actualizarPerfil(from, cambios);
+  return { contacto: datos, perfil: memoria.fusionarPerfil(perfil, cambios) };
+}
+
 async function ejecutarHerramienta(nombre, args, from, historial) {
   const telefono = from.replace('whatsapp:', '');
 
@@ -1336,7 +1426,7 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
         encontrados: resultados.length,
         productos: resultados.map(p => ({
           nombre: p.nombre,
-          ...infoPrecioVariantes(p),
+          ...conPrecioEfectivo(infoPrecioVariantes(p)),
           ...infoVentaPorJuego(p, parsearPrecio(p.precio)),
           material: p.material, medidas: p.medidas,
           // La descripción que escribió el equipo en Inventario: datos reales para responder
@@ -1374,7 +1464,7 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
         presupuesto: formatearMoneda(presupuesto),
         productos: resultados.map(p => ({
           nombre: p.nombre,
-          ...infoPrecioVariantes(p),
+          ...conPrecioEfectivo(infoPrecioVariantes(p)),
           ...infoVentaPorJuego(p, parsearPrecio(p.precio)),
           material: p.material, medidas: p.medidas,
           // La descripción que escribió el equipo en Inventario: datos reales para responder
@@ -1460,7 +1550,8 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
       });
       return {
         items: itemsFormateados, total: formatearMoneda(total),
-        totalNumerico: total, cantidad_items: items.length
+        totalNumerico: total, cantidad_items: items.length,
+        ...totalConDescuento(total),
       };
     }
 
@@ -1537,7 +1628,7 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
         const total = items.reduce((s, i) => s + parsearPrecio(i.precio) * (i.cantidad || 1), 0);
         return {
           exito: true, mensaje: `Cantidad de "${nombreCarrito}" actualizada a ${nuevaCantidad} unidad${nuevaCantidad > 1 ? 'es' : ''}.`,
-          items_en_carrito: items.length, total_carrito: formatearMoneda(total)
+          items_en_carrito: items.length, total_carrito: formatearMoneda(total), ...totalConDescuento(total)
         };
       }
       // Guardar también como último producto visto (con el nombre real del catálogo,
@@ -1547,8 +1638,10 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
       const itemsActualizados = await db.verCarrito(from);
       const total = itemsActualizados.reduce((s, i) => s + parsearPrecio(i.precio) * (i.cantidad || 1), 0);
 
-      // Si el cliente no vuelve, se le escribe UNA vez a las 24 h. Se reprograma con cada
-      // producto que añade, así el mensaje habla siempre de lo último que le interesó.
+      // Si el cliente no vuelve, se le escribe UNA vez al día siguiente (20 h, dentro de la
+      // ventana de 24 h). Se reprograma con cada producto que añade, así el mensaje habla
+      // siempre de lo último que le interesó. El "¿pudiste pensarlo?" queda sobrando.
+      cancelarInteresPendiente(telefono);
       seguimientos.programarCarritoAbandonado(depsSeguimientos(), {
         destinatario: telefono,
         producto:     nombreCarrito,
@@ -1558,7 +1651,7 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
       return {
         exito: true, mensaje: `${nombreCarrito} agregado al carrito por ${precio}.`,
         variante: etiquetaVariante,
-        items_en_carrito: itemsActualizados.length, total_carrito: formatearMoneda(total)
+        items_en_carrito: itemsActualizados.length, total_carrito: formatearMoneda(total), ...totalConDescuento(total)
       };
     }
 
@@ -1613,6 +1706,10 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
         alertar('Cliente superó el tope de pedidos diarios', `${telefono}: intentó confirmar otro pedido. No se creó tarjeta; revisar la conversación.`);
         return { exito: false, error: "Este cliente ya confirmó varios pedidos en las últimas 24 horas. NO se registró uno nuevo. Dile con amabilidad que un asesor lo va a contactar para revisar todo su pedido junto, y no vuelvas a llamar confirmar_pedido." };
       }
+      // El pedido lo cierra un asesor: necesita saber a quién llamar (igual que al transferir).
+      const resueltoPedido = await resolverContactoParaAsesor(from, args, 'confirmar_pedido');
+      if (resueltoPedido.respuesta) return resueltoPedido.respuesta;
+      const contactoPedido = resueltoPedido.contacto;
       let total = 0;
       const resumenItems = items.map((item, i) => {
         const cant = item.cantidad || 1;
@@ -1626,6 +1723,7 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
       await db.marcarPedidoConfirmado(from);
       // El carrito ya es un pedido: recordárselo sería absurdo.
       seguimientos.cancelar(depsSeguimientos(), { destinatario: telefono, tipo: seguimientos.TIPOS.CARRITO_ABANDONADO }).catch(() => {});
+      cancelarInteresPendiente(telefono);
       // Se vacía el carrito (ya es un pedido) pero NO se borra el historial ni el estado:
       // antes `resetearEstadoSinPedido` + `limpiarConversaciones` dejaban al cliente sin
       // contexto justo después de comprar, así que un "¿cuándo me llega?" a los dos
@@ -1636,15 +1734,29 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
       evento(telefono, 'pedido', `$${total.toLocaleString('es-CO')}`);
       // Ciudad y forma de pago, si las dio: el asesor sabe de una vez si el envío es gratis
       // y si aplica el descuento (efectivo/transferencia).
-      const datosCierre = [args.ciudad && `Entrega en: ${String(args.ciudad).slice(0, 80)}`, args.forma_pago && `Pago: ${String(args.forma_pago).slice(0, 40)}`].filter(Boolean).join(' · ');
-      notificarRedes(telefono, resumenItems.join('\n') + (datosCierre ? `\n${datosCierre}` : ''), historial, 'pedido', { carrito: items });
+      // Si dijo que paga en efectivo o transferencia, el total con el descuento (lo calcula
+      // el código) va en el mensaje y en la tarjeta: el asesor ve lo que se le prometió.
+      const pagaConDescuento = /efectivo|transfer|consignaci|nequi|daviplata/i.test(String(args.forma_pago ?? ''));
+      const totalEfectivo = pagaConDescuento ? negocio.conDescuentoEfectivo(total) : null;
+      const lineaEfectivo = totalEfectivo ? `Con ${negocio.porcentajeDescuentoEfectivo}% de descuento por pago en efectivo/transferencia: ${formatearMoneda(totalEfectivo)}` : null;
+      const datosCierre = [
+        contacto.lineaContacto(contactoPedido),
+        [args.ciudad && `Entrega en: ${String(args.ciudad).slice(0, 80)}`, args.forma_pago && `Pago: ${String(args.forma_pago).slice(0, 40)}`].filter(Boolean).join(' · '),
+        lineaEfectivo,
+      ].filter(Boolean).join('\n');
+      notificarRedes(telefono, resumenItems.join('\n') + (datosCierre ? `\n${datosCierre}` : ''), historial, 'pedido', {
+        carrito: items,
+        nombre: contactoPedido.nombre || undefined,
+        contacto: contacto.payloadContacto(contactoPedido, resueltoPedido.perfil, { ciudad: args.ciudad, forma_pago: args.forma_pago }),
+      });
       // Mensaje de confirmación con resumen exacto — el campo 'mensaje_enviado' le indica a la IA que no lo repita
       const avisoHorarioPedido = avisoFueraHorario();
       return {
         exito: true,
         resumen: resumenItems.join('\n'),
         total: formatearMoneda(total),
-        mensaje_confirmacion: `¡Pedido confirmado! 🎉\n\n${resumenItems.join('\n')}\n\n*Total: ${formatearMoneda(total)}*\n\nUn asesor de ${negocio.nombreEmpresa} te contactará pronto para coordinar el pago y la entrega. ¡Gracias por elegir ${negocio.nombreEmpresa}! 😊`,
+        ...(totalEfectivo && { total_con_descuento_efectivo: formatearMoneda(totalEfectivo) }),
+        mensaje_confirmacion: `¡Pedido confirmado! 🎉\n\n${resumenItems.join('\n')}\n\n*Total: ${formatearMoneda(total)}*${totalEfectivo ? `\n*Pagando en efectivo o transferencia (${negocio.porcentajeDescuentoEfectivo}% de descuento): ${formatearMoneda(totalEfectivo)}*` : ''}\n\nUn asesor de ${negocio.nombreEmpresa} te contactará pronto para coordinar el pago y la entrega. ¡Gracias por elegir ${negocio.nombreEmpresa}! 😊`,
         aviso_horario: avisoHorarioPedido,
         instruccion_ia: `Comparte el mensaje_confirmacion tal cual al cliente, sin cambiar nada. Luego solo añade una frase corta de despedida.${avisoHorarioPedido ? ' Y como es fuera de horario, avísale que un asesor lo contactará en el próximo horario hábil para que no espere.' : ''}`
       };
@@ -1754,6 +1866,10 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
       }
 
       evento(telefono, 'cita', `${sedeNombre} — ${diaCapitalizado} ${horaFormateada}`)
+      cancelarInteresPendiente(telefono);
+      // El nombre de la cita queda en el perfil: si luego pide un asesor, no se le vuelve a
+      // preguntar. En WhatsApp el número del chat es su contacto para el cliente de redes.
+      await actualizarPerfil(from, { nombre: nombreLimpio });
       const resumenCita = `${nombreLimpio} — ${sedeNombre} — ${diaCapitalizado} ${horaFormateada}${motivoFinal ? ` — ${motivoFinal}` : ''}`
       notificarRedes(
         telefono,
@@ -1849,6 +1965,13 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
       // El tipo llega al panel de ventas para que la tarjeta se etiquete como
       // "Solicitud de personalización" en vez de una petición de asesor genérica.
       const tipoTransferencia = args.tipo === 'personalizacion' ? 'personalizacion' : 'asesor';
+      // Nombre y celular primero: sin ellos el asesor no sabe a quién busca ni a dónde
+      // llamar, y el cliente de redes queda sin datos en el sistema.
+      const resuelto = await resolverContactoParaAsesor(from, args, 'transferir_asesor');
+      if (resuelto.respuesta) return resuelto.respuesta;
+      const datosContacto = resuelto.contacto;
+      const extraContacto = { contacto: contacto.payloadContacto(datosContacto, resuelto.perfil), nombre: datosContacto.nombre || undefined };
+      cancelarInteresPendiente(telefono);
       // Adjuntar contexto del estado aunque Elena no lo haya incluido en razon
       const estadoActual = await db.getEstado(from);
       const ultimoProd   = estadoActual?.ultimo_producto ? (typeof estadoActual.ultimo_producto === 'string' ? JSON.parse(estadoActual.ultimo_producto) : estadoActual.ultimo_producto) : null;
@@ -1861,6 +1984,8 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
         const resumenCarrito = carritoActual.map(i => `${i.producto} ×${i.cantidad || 1}`).join(', ');
         razonFinal += `\nCarrito: ${resumenCarrito}`;
       }
+      const lineaContactoTr = contacto.lineaContacto(datosContacto);
+      if (lineaContactoTr) razonFinal = `${lineaContactoTr}\n${razonFinal}`;
       // Fuera de horario (o a menos de 20 min del cierre): nadie va a tomar la tarjeta
       // hasta el próximo día hábil, así que NO se silencia a la IA — antes el cliente
       // quedaba toda la noche hablando con nadie. La tarjeta se crea igual (el asesor la
@@ -1872,7 +1997,7 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
         const yaPendiente = await db.solicitudAsesorPendiente(from);
         if (!yaPendiente) {
           evento(telefono, 'transferencia', `${tipoTransferencia} (fuera de horario): ${razon}`);
-          notificarRedes(telefono, razonFinal, historial, tipoTransferencia, { carrito: carritoActual.length ? carritoActual : undefined });
+          notificarRedes(telefono, razonFinal, historial, tipoTransferencia, { carrito: carritoActual.length ? carritoActual : undefined, ...extraContacto });
         }
         return {
           exito: true,
@@ -1882,12 +2007,12 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
       }
 
       evento(telefono, 'transferencia', `${tipoTransferencia}: ${razon}`);
-      notificarRedes(telefono, razonFinal, historial, tipoTransferencia, { carrito: carritoActual.length ? carritoActual : undefined });
+      notificarRedes(telefono, razonFinal, historial, tipoTransferencia, { carrito: carritoActual.length ? carritoActual : undefined, ...extraContacto });
       await db.marcarTransferida(from);
       // El historial NO se borra: la nota de reactivación le dice a Elena que "use el
       // historial para ver qué buscaba" cuando el asesor libera el chat, y si se borraba
       // aquí no quedaba nada que mirar.
-      return { exito: true, mensaje: 'Asesor notificado. Confírmale al cliente que lo estás conectando con un asesor que lo atenderá pronto 😊.' };
+      return { exito: true, mensaje: `Asesor notificado. Confírmale al cliente${datosContacto.nombre ? ` (${datosContacto.nombre})` : ''} que lo estás conectando con un asesor que lo atenderá pronto${datosContacto.telefono ? ' y que lo contactarán al número que dejó' : ''} 😊.` };
     }
 
     case 'recordar_preferencia': {
@@ -1911,6 +2036,14 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
         'asesor',
         { carrito: carritoObj.length ? carritoObj : undefined }
       );
+      // Si se va sin carrito, mañana Elena retoma la conversación una sola vez (dentro de la
+      // ventana de 24 h). Con carrito ya lo cubre el recordatorio de carrito abandonado.
+      seguimientos.programarInteresPendiente(depsSeguimientos(), {
+        destinatario: telefono,
+        producto:     args.producto || null,
+        nombre:       await db.getNombreCliente(from).catch(() => null),
+        tieneCarrito: carritoObj.length > 0,
+      }).catch(e => console.warn('[seguimientos] interés pendiente no programado:', e.message));
       return {
         ok: true,
         mensaje: 'Registrado para el equipo de ventas. NO le menciones esto al cliente ni te despidas: sigue atendiéndolo e intenta resolver la objeción tú misma (opciones más económicas con buscar_por_presupuesto, beneficios del producto, formas de pago).'

@@ -193,7 +193,8 @@ describe('El prompt generado conserva las reglas críticas', () => {
     // El carrusel solo existe en Instagram
     expect(ig).toContain('enviar_carrusel');
     expect(ws).not.toContain('enviar_carrusel');
-    // Y la nota de no mencionar WhatsApp, también
-    expect(ig).toContain('No menciones WhatsApp');
+    // Y la nota de no dar números de la empresa, también (pedirle SU celular sí se puede)
+    expect(ig).toContain('No le des números de WhatsApp');
+    expect(ws).not.toContain('No le des números de WhatsApp');
   });
 });

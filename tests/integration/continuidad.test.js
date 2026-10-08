@@ -116,7 +116,7 @@ describe('Retención de contexto', () => {
   test('el carrito se vacía al confirmar el pedido, pero el historial se conserva', async () => {
     db.verCarrito.mockResolvedValue([{ producto: 'CAMA BALI', precio: '$2.880.000', cantidad: 1 }]);
     mockOpenAICreate
-      .mockResolvedValueOnce(respuestaConTool('confirmar_pedido'))
+      .mockResolvedValueOnce(respuestaConTool('confirmar_pedido', { nombre: 'Laura Gómez', telefono_contacto: 'este_mismo' }))
       .mockResolvedValue(respuestaSimple('¡Gracias! 😊'));
 
     const from = 'whatsapp:+573007770001';
@@ -133,7 +133,7 @@ describe('Retención de contexto', () => {
 
   test('al transferir al asesor tampoco se borra el historial', async () => {
     mockOpenAICreate
-      .mockResolvedValueOnce(respuestaConTool('transferir_asesor', { razon: 'Quiere cotizar a medida' }))
+      .mockResolvedValueOnce(respuestaConTool('transferir_asesor', { razon: 'Quiere cotizar a medida', nombre: 'Laura Gómez', telefono_contacto: 'este_mismo' }))
       .mockResolvedValue(respuestaSimple('Te conecto 😊'));
 
     recibirMensaje({ from: 'whatsapp:+573007770002', toNumber: TO, texto: 'quiero un asesor' });

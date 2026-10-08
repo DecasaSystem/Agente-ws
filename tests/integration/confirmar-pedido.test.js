@@ -41,7 +41,7 @@ const esperar = () => new Promise(r => setTimeout(r, 20));
 beforeEach(() => { mockFetch.mockClear(); mockPedidosRecientes.mockResolvedValue(0); });
 
 test('el aviso al asesor lleva la ciudad y la forma de pago', async () => {
-  const r = await ejecutarHerramienta('confirmar_pedido', { ciudad: 'Pereira', forma_pago: 'transferencia' }, 'whatsapp:+573001112233', []);
+  const r = await ejecutarHerramienta('confirmar_pedido', { nombre: 'Laura Gómez', telefono_contacto: 'este_mismo', ciudad: 'Pereira', forma_pago: 'transferencia' }, 'whatsapp:+573001112233', []);
   await esperar();
   expect(r.exito).toBe(true);
   const aviso = JSON.parse(mockFetch.mock.calls[0][1].body);
@@ -51,7 +51,7 @@ test('el aviso al asesor lleva la ciudad y la forma de pago', async () => {
 });
 
 test('sin esos datos el pedido se confirma igual', async () => {
-  const r = await ejecutarHerramienta('confirmar_pedido', {}, 'whatsapp:+573001112233', []);
+  const r = await ejecutarHerramienta('confirmar_pedido', { nombre: 'Laura Gómez', telefono_contacto: 'este_mismo' }, 'whatsapp:+573001112233', []);
   await esperar();
   expect(r.exito).toBe(true);
   expect(JSON.parse(mockFetch.mock.calls[0][1].body).resumen).not.toMatch(/Entrega en/);
@@ -59,7 +59,7 @@ test('sin esos datos el pedido se confirma igual', async () => {
 
 test('pasado el tope de pedidos del día no se crea otra tarjeta', async () => {
   mockPedidosRecientes.mockResolvedValue(3);
-  const r = await ejecutarHerramienta('confirmar_pedido', {}, 'whatsapp:+573001112233', []);
+  const r = await ejecutarHerramienta('confirmar_pedido', { nombre: 'Laura Gómez', telefono_contacto: 'este_mismo' }, 'whatsapp:+573001112233', []);
   await esperar();
   expect(r.exito).toBe(false);
   expect(r.error).toMatch(/asesor/);
