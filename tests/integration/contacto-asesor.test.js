@@ -3,8 +3,10 @@
 // También: el descuento del 5 % por efectivo/transferencia lo calcula el código.
 
 const mockFetch = jest.fn(async () => ({ ok: true }));
-const mockPerfil = jest.fn(async () => null);
-const mockSetPerfil = jest.fn(async () => {});
+// El perfil simulado recuerda lo que se guarda, como el de verdad.
+let perfilActual = null;
+const mockPerfil = jest.fn(async () => perfilActual);
+const mockSetPerfil = jest.fn(async (_de, p) => { perfilActual = p; });
 const mockGuardarPedido = jest.fn(async () => true);
 const mockMarcarTransferida = jest.fn(async () => {});
 
@@ -56,7 +58,8 @@ beforeEach(() => {
   mockGuardarPedido.mockClear();
   mockMarcarTransferida.mockClear();
   mockSetPerfil.mockClear();
-  mockPerfil.mockResolvedValue(null);
+  perfilActual = null;
+  mockPerfil.mockImplementation(async () => perfilActual);
 });
 
 describe('transferir_asesor', () => {
@@ -145,4 +148,58 @@ test('ver_carrito trae el total pagando en efectivo o transferencia', async () =
   expect(r.total).toBe('$2.980.000');
   expect(r.total_con_descuento_efectivo).toBe('$2.831.000');
   expect(r.porcentaje_descuento_efectivo).toBe(5);
+});
+
+describe('guardar_contacto: el cliente queda en Clientes → Redes apenas da sus datos', () => {
+  const sincronizaciones = () => mockFetch.mock.calls
+    .filter(c => String(c[0]).includes('/api/agentes/clientes-redes'))
+    .map(c => JSON.parse(c[1].body));
+
+  test('con nombre y "este mismo número" se guarda en el sistema SIN crear tarjeta', async () => {
+    const r = await ejecutarHerramienta('guardar_contacto', { nombre: 'carolina ruiz', telefono_contacto: 'este_mismo' }, DE, []);
+    await esperar();
+    expect(r.ok).toBe(true);
+    expect(r.mensaje).toMatch(/Carolina Ruiz/);
+    expect(avisos()).toHaveLength(0);
+    const [s] = sincronizaciones();
+    expect(s).toMatchObject({ fuente: 'whatsapp', telefono: '+573001112233', contacto: { nombre: 'Carolina Ruiz', telefono: '+573001112233' } });
+  });
+
+  test('lo que busca viaja a la ficha cuando ya dejó sus datos', async () => {
+    await ejecutarHerramienta('guardar_contacto', { nombre: 'Carolina' }, DE, []);
+    await ejecutarHerramienta('recordar_preferencia', { espacio: 'habitación principal', interes: 'Cama queen en madera clara, máximo $3.000.000' }, DE, []);
+    await esperar();
+    const ultima = sincronizaciones().pop();
+    expect(ultima.contacto).toMatchObject({ nombre: 'Carolina', espacio: 'habitación principal', interes: 'Cama queen en madera clara, máximo $3.000.000' });
+  });
+
+  test('sin nombre ni celular, lo que busca no crea ficha (no se manda nada)', async () => {
+    await ejecutarHerramienta('recordar_preferencia', { interes: 'Mira sofás' }, DE, []);
+    await esperar();
+    expect(sincronizaciones()).toHaveLength(0);
+  });
+
+  test('un número que no es celular no se guarda y se le pide a Elena confirmarlo', async () => {
+    const r = await ejecutarHerramienta('guardar_contacto', { telefono_contacto: '12345' }, DE, []);
+    await esperar();
+    expect(r.ok).toBe(false);
+    expect(r.error).toMatch(/10 dígitos/);
+    expect(sincronizaciones()).toHaveLength(0);
+  });
+
+  test('si no quiso darlos, al transferir no se le vuelven a pedir', async () => {
+    await ejecutarHerramienta('guardar_contacto', { cliente_no_quiso_dar_datos: true }, DE, []);
+    const r = await ejecutarHerramienta('transferir_asesor', { razon: 'Quiere un asesor' }, DE, []);
+    await esperar();
+    expect(r.exito).toBe(true);
+    expect(avisos()).toHaveLength(1);
+  });
+
+  test('si ya los dejó antes, la transferencia los usa sin preguntar', async () => {
+    await ejecutarHerramienta('guardar_contacto', { nombre: 'Carolina', telefono_contacto: '3104445566' }, DE, []);
+    const r = await ejecutarHerramienta('transferir_asesor', { razon: 'Quiere un asesor' }, DE, []);
+    await esperar();
+    expect(r.exito).toBe(true);
+    expect(avisos()[0].contacto).toMatchObject({ nombre: 'Carolina', telefono: '+573104445566' });
+  });
 });

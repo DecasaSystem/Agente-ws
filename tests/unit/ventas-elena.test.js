@@ -126,9 +126,30 @@ describe('prompt de ventas', () => {
 
   test('el catálogo va de una vez cuando piden una categoría, y en el mismo mensaje una pregunta', () => {
     for (const p of [ws, ig]) {
-      expect(p).toContain('ANTOJA CON EL CATÁLOGO Y ENTIENDE QUÉ BUSCA');
+      expect(p).toContain('MUESTRA EL CATÁLOGO Y ENTIENDE QUÉ BUSCA');
+      expect(p).not.toMatch(/antoj/i);
       expect(p).toMatch(/"quiero ver camas".*llama enviar_catalogo de esa categoría DE UNA VEZ/s);
       expect(p).toMatch(/MISMO mensaje arranca la conversación con UNA pregunta/);
+    }
+  });
+
+  test('pide nombre y celular temprano y lleva lo que busca, aunque no transfiera', () => {
+    for (const p of [ws, ig]) {
+      expect(p).toContain('DATOS DEL CLIENTE — PÍDELOS TEMPRANO Y GUÁRDALOS');
+      expect(p).toMatch(/llama guardar_contacto/);
+      expect(p).toMatch(/recordar_preferencia con el campo interes/);
+      expect(p).toMatch(/NO se los vuelvas a pedir/);
+    }
+    expect(ws).toMatch(/¿Y te puedo contactar a este mismo número/);
+    expect(ig).toMatch(/Déjame también un celular/);
+  });
+
+  test('si no sabe un dato no lo inventa: lo pasa a un asesor', () => {
+    for (const [p, herramienta] of [[ws, 'transferir_asesor'], [ig, 'solicitar_asesor']]) {
+      expect(p).toContain('SI NO LO SABES, NO LO INVENTES: PÁSALO A UN ASESOR — REGLA ABSOLUTA');
+      expect(p).toMatch(/tiempos de fabricación o de entrega, garantía/);
+      expect(p).toContain(`llama ${herramienta} con un motivo que diga exactamente qué hay que confirmarle`);
+      expect(p).toMatch(/Nunca respondas "sí" o "claro" a algo que no puedes verificar/);
     }
   });
 

@@ -604,6 +604,37 @@ function notificarRedes(telefono, mensaje, historial, tipo = 'asesor', extra = {
     });
 }
 
+// Pone al día la ficha del cliente en Clientes → Redes del sistema de ventas: nombre,
+// celular y lo que busca. NO crea tarjeta ni avisa a nadie (eso es notificarRedes). Solo
+// sale si el cliente ya dio nombre o celular (dueño, 2026-10-08: "que se guarden apenas
+// da los datos"). Sin cola de reintentos a propósito: si falla, la próxima sincronización
+// o el aviso de la transferencia llevan los mismos datos. Nunca bloquea ni rompe el turno.
+function sincronizarClienteRed(from) {
+  const apiUrl = process.env.DECASA_API_URL;
+  if (!apiUrl) return Promise.resolve(false);
+  const telefono = from.replace('whatsapp:', '');
+  return (async () => {
+    const perfil = await db.getPerfil(from);
+    if (!perfil?.nombre && !perfil?.telefono_contacto) return false;
+    const datos = contacto.contactoDesdePerfil(perfil);
+    if (!datos) return false;
+    await fetchWithRetry(`${apiUrl}/api/agentes/clientes-redes`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Agent-Token': process.env.DECASA_AGENT_TOKEN || '' },
+      body:    JSON.stringify({
+        fuente: 'whatsapp',
+        telefono,
+        contacto: datos,
+        contacto_url: `https://wa.me/${telefono.replace(/\D/g, '')}`,
+      }),
+    }, 1, 15000);
+    return true;
+  })().catch(e => {
+    console.warn(`[clientes-redes] no se pudo sincronizar ${telefono}:`, e.message);
+    return false;
+  });
+}
+
 // ¿El sistema de ventas rechazó la notificación de forma definitiva? Un 4xx (payload
 // inválido, tipo desconocido, token equivocado) no se arregla reintentando; un 408/429 sí.
 // El mensaje de error viene de fetchWithRetry con la forma "HTTP 422 ...".
@@ -1274,13 +1305,25 @@ const TOOLS = [
     type: 'function',
     function: {
       name: 'recordar_preferencia',
-      description: 'Guarda lo que el cliente cuenta de sí mismo para no hacérselo repetir en otra conversación: para qué espacio busca el mueble ("apartamento pequeño", "sala de la casa nueva", "cuarto de mi hija") y qué le gusta o necesita ("madera clara", "que resista mascotas", "tela que no se manche"). Llámalo en cuanto lo diga, sin anunciárselo. NO guardes datos sensibles ni nada que no sirva para venderle mejor.',
+      description: 'Guarda lo que el cliente cuenta de sí mismo y lo que busca, para no hacérselo repetir y para que el asesor lo vea en la ficha del cliente: para qué espacio busca el mueble ("apartamento pequeño", "cuarto de mi hija"), qué le gusta o necesita ("madera clara", "que resista mascotas") y un resumen actualizado de lo que busca. Llámalo cada vez que aprendas algo nuevo, sin anunciárselo. NO guardes datos sensibles ni nada que no sirva para venderle mejor.',
       parameters: {
         type: 'object',
         properties: {
           espacio:      { type: 'string', description: 'Para qué espacio o persona busca el mueble' },
           preferencias: { type: 'array', items: { type: 'string' }, description: 'Gustos o necesidades concretas (material, color, resistencia)' },
+          interes:      { type: 'string', description: 'UNA frase con TODO lo que sabes de lo que busca, actualizada: qué mueble, medida, color/material, espacio, presupuesto, para cuándo. Ej: "Cama queen en madera clara para la habitación principal, máximo $3.000.000, la necesita este mes"' },
         }
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'guardar_contacto',
+      description: 'Guarda el nombre y/o el celular del cliente en el sistema de ventas (Clientes → Redes) apenas te los dé, aunque no vaya a hablar con un asesor. No crea ninguna solicitud ni avisa a nadie. Si no quiere darlos, llámala con cliente_no_quiso_dar_datos=true para no volver a pedírselos.',
+      parameters: {
+        type: 'object',
+        properties: PARAMS_CONTACTO,
       }
     }
   },
@@ -1797,6 +1840,11 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
         };
       }
       evento(telefono, 'catalogo', `${encontrado.fuente}: ${encontrado.nombre}`);
+      // Lo que pidió ver es lo que le interesa: queda en su perfil y en su ficha.
+      if (categoria && categoria !== 'todos') {
+        await actualizarPerfil(from, { categorias_interes: [String(categoria).trim().toLowerCase()] });
+        sincronizarClienteRed(from);
+      }
       return {
         exito: true,
         url: encontrado.url,
@@ -2016,8 +2064,37 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
     }
 
     case 'recordar_preferencia': {
-      await actualizarPerfil(from, { espacio: args.espacio, preferencias: args.preferencias });
+      await actualizarPerfil(from, { espacio: args.espacio, preferencias: args.preferencias, interes: args.interes });
+      // Si el cliente ya dejó nombre o celular, su ficha en el sistema se pone al día con lo
+      // que busca (sin datos de contacto no hay ficha que actualizar).
+      sincronizarClienteRed(from);
       return { ok: true, mensaje: 'Anotado. NO se lo menciones al cliente: sigue la conversación con normalidad.' };
+    }
+
+    case 'guardar_contacto': {
+      // Dueño (2026-10-08): el cliente queda en Clientes → Redes apenas da sus datos,
+      // aunque no pida asesor. Va al sistema sin crear tarjeta ni avisar a nadie.
+      if (args.cliente_no_quiso_dar_datos === true && !args.nombre && !args.telefono_contacto) {
+        await actualizarPerfil(from, { no_quiso_dar_datos: true });
+        evento(telefono, 'contacto_negado', '');
+        return { ok: true, mensaje: 'Anotado: no se los vuelvas a pedir. Sigue atendiéndolo igual de bien.' };
+      }
+      const datos = contacto.resolverContacto({ canal: 'whatsapp', args, perfil: null, telefonoCanal: telefono });
+      const cambios = {};
+      if (datos.nombre) cambios.nombre = datos.nombre;
+      if (datos.telefono) cambios.telefono_contacto = datos.telefono;
+      if (!Object.keys(cambios).length) {
+        return { ok: false, error: 'No reconocí un nombre ni un celular válido en lo que te dio. Si te dio un número, confírmalo amablemente con él (un celular colombiano tiene 10 dígitos y empieza por 3); si no, sigue la conversación sin insistir.' };
+      }
+      await actualizarPerfil(from, cambios);
+      evento(telefono, 'contacto_guardado', Object.keys(cambios).join(','));
+      sincronizarClienteRed(from);
+      const telefonoMal = args.telefono_contacto && !datos.telefono;
+      return {
+        ok: true,
+        guardado: cambios,
+        mensaje: `Guardado. Agradécele${datos.nombre ? ` llamándolo por su nombre (${datos.nombre})` : ''} y sigue vendiendo; no lo conviertas en trámite.${telefonoMal ? ' Ojo: el número que dio no parece un celular válido; confírmalo con amabilidad.' : ''}`,
+      };
     }
 
     case 'reportar_objecion': {
