@@ -79,6 +79,7 @@ const vigilancia = require('./vigilancia');
 const seguimientos = require('./seguimientos');
 const memoria = require('./memoria');
 const contacto = require('./contacto');
+const { revisarRespuesta } = require('./verificacion');
 const log = require('./log');
 const { conReintentos } = reintentos;
 
@@ -1475,7 +1476,8 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
           // La descripción que escribió el equipo en Inventario: datos reales para responder
           // en vez de inventar. Recortada para no inflar el contexto.
           ...(p.descripcion && { descripcion: String(p.descripcion).slice(0, 300) }),
-          foto_disponible: p.tieneImagen, categoria: p.categoriaNombre
+          foto_disponible: p.tieneImagen, categoria: p.categoriaNombre,
+          ...(negocio.notaDeVenta(p.categoria) && { nota_venta: negocio.notaDeVenta(p.categoria) })
         }))
       };
     }
@@ -1513,7 +1515,8 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
           // La descripción que escribió el equipo en Inventario: datos reales para responder
           // en vez de inventar. Recortada para no inflar el contexto.
           ...(p.descripcion && { descripcion: String(p.descripcion).slice(0, 300) }),
-          foto_disponible: p.tieneImagen, categoria: p.categoriaNombre
+          foto_disponible: p.tieneImagen, categoria: p.categoriaNombre,
+          ...(negocio.notaDeVenta(p.categoria) && { nota_venta: negocio.notaDeVenta(p.categoria) })
         }))
       };
     }
@@ -2224,9 +2227,12 @@ async function runAgentLoop(from, mensajeUsuario, opciones = {}) {
   // Lo que ya se sabe del cliente (presupuesto, espacio, gustos, productos que vio) y el
   // resumen de lo hablado si la conversación se hizo larga. Ninguno de los dos debe romper
   // el turno si falla.
-  let contextoPerfil = null, contextoResumen = null;
+  let contextoPerfil = null, contextoResumen = null, notaDatos = null;
   try {
-    contextoPerfil = memoria.construirContextoPerfil(await db.getPerfil(from), { formatearMoneda });
+    const perfilTurno = await db.getPerfil(from);
+    contextoPerfil = memoria.construirContextoPerfil(perfilTurno, { formatearMoneda });
+    // Pedir nombre y celular en el momento justo (ver memoria.notaPedirDatos).
+    notaDatos = memoria.notaPedirDatos({ perfil: perfilTurno, historial });
     const resumen = await db.getResumenConversacion(from);
     contextoResumen = memoria.construirContextoResumen(resumen);
   } catch (e) {
@@ -2260,6 +2266,7 @@ async function runAgentLoop(from, mensajeUsuario, opciones = {}) {
     ...(notaReactivacion ? [{ role: 'system', content: notaReactivacion }] : []),
     ...(notaRegreso ? [{ role: 'system', content: notaRegreso }] : []),
     ...(contextoPerfil ? [{ role: 'system', content: contextoPerfil }] : []),
+    ...(notaDatos ? [{ role: 'system', content: notaDatos }] : []),
     ...(contextoResumen ? [{ role: 'system', content: contextoResumen }] : []),
     ...(contextoMostrados ? [{ role: 'system', content: contextoMostrados }] : []),
     ...historial.map(m => ({ role: m.role, content: m.content })),
@@ -2288,6 +2295,12 @@ async function runAgentLoop(from, mensajeUsuario, opciones = {}) {
     logUsoTokens(from, tokPrompt, tokCompletion, rondas, etiqueta, tokCacheados);
     return true;
   };
+
+  // Para la revisión antes de enviar (verificacion.js): qué herramientas se llamaron en el
+  // turno y qué devolvieron. Una sola corrección por turno.
+  const herramientasTurno = [];
+  const resultadosTurno = [];
+  let yaCorregida = false;
 
   for (let ronda = 0; ronda < maxRondas; ronda++) {
     // Con reintentos: un 429 o un 5xx pasajero de OpenAI ya no tumba el turno ni dispara
@@ -2338,6 +2351,8 @@ async function runAgentLoop(from, mensajeUsuario, opciones = {}) {
         }
 
         const resultadoStr = JSON.stringify(resultado);
+        herramientasTurno.push(toolCall.function.name);
+        resultadosTurno.push(resultadoStr);
         for (const n of extraerPrecios(resultadoStr)) preciosVistos.add(n);
         messages.push({
           role: 'tool',
@@ -2356,7 +2371,23 @@ async function runAgentLoop(from, mensajeUsuario, opciones = {}) {
     } else {
       if (await asesorTomoElChat(ronda + 1)) return DESCARTADA;
       const texto = choice.message.content || 'Disculpa, no pude generar una respuesta. Por favor intenta de nuevo. 😊';
+      // Que no diga que hizo algo que no hizo, ni mande un enlace inventado: si pasa, la
+      // respuesta no sale y el modelo la corrige (una vez, y solo si quedan rondas).
+      const correccion = !yaCorregida && ronda < maxRondas - 1
+        ? revisarRespuesta({ texto, herramientas: herramientasTurno, resultados: resultadosTurno })
+        : null;
+      if (correccion) {
+        yaCorregida = true;
+        const motivoCorreccion = correccion.split('\n')[1] ?? '';
+        log.info('respuesta_corregida', { motivo: motivoCorreccion.slice(0, 160) });
+        evento(from.replace('whatsapp:', ''), 'respuesta_corregida', motivoCorreccion.slice(0, 120));
+        messages.push({ role: 'assistant', content: texto });
+        messages.push({ role: 'system', content: correccion });
+        continue;
+      }
       validarPrecios(from, texto, preciosVistos);
+      // Si en esta respuesta le pidió los datos, no se los vuelve a pedir por su cuenta.
+      if (notaDatos && memoria.pidioDatos(texto)) actualizarPerfil(from, { datos_pedidos: true }).catch(() => {});
       logUsoTokens(from, tokPrompt, tokCompletion, ronda + 1, etiqueta, tokCacheados);
       return { texto, imagenesParaEnviar };
     }

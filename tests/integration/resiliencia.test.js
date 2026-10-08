@@ -414,3 +414,35 @@ describe('Nombre del cliente (ProfileName de Twilio)', () => {
     expect(cuerpo.tipo).toBe('asesor');
   });
 });
+
+// Revisión antes de enviar (verificacion.js): en la evaluación con el modelo real, Elena
+// decía "te envío el catálogo" sin llamar la herramienta y una vez inventó un enlace.
+describe('No dice que hizo algo que no hizo', () => {
+  test('si promete el catálogo sin enviarlo, esa respuesta no le llega al cliente y se corrige', async () => {
+    mockOpenAICreate
+      .mockResolvedValueOnce(respuestaSimple('¡Claro! Te envío el catálogo de camas. ¿La buscas doble o queen?'))
+      .mockResolvedValueOnce(respuestaSimple('¿Las camas que buscas son dobles o queen? Así te muestro las que mejor te quedan 😊'))
+      .mockResolvedValue(respuestaSimple('ok'));
+
+    recibirMensaje({ from: 'whatsapp:+573005550001', toNumber: TO, texto: 'estoy buscando una cama' });
+    await correrTurno();
+
+    const enviados = mockTwilioCreate.mock.calls.map(c => String(c[0].body));
+    expect(enviados.some(b => b.includes('Te envío el catálogo'))).toBe(false);
+    expect(enviados.some(b => b.includes('dobles o queen'))).toBe(true);
+    // La segunda llamada al modelo lleva la corrección.
+    const segunda = mockOpenAICreate.mock.calls[1][0].messages;
+    expect(segunda.at(-1)).toMatchObject({ role: 'system' });
+    expect(segunda.at(-1).content).toMatch(/REVISIÓN ANTES DE ENVIAR/);
+  });
+
+  test('una respuesta honesta sale tal cual, sin llamadas de más', async () => {
+    mockOpenAICreate.mockResolvedValue(respuestaSimple('¿Te mando el catálogo de camas? 😊'));
+
+    recibirMensaje({ from: 'whatsapp:+573005550002', toNumber: TO, texto: 'tienen camas dobles?' });
+    await correrTurno();
+
+    expect(mockOpenAICreate).toHaveBeenCalledTimes(1);
+    expect(mockTwilioCreate.mock.calls.map(c => String(c[0].body)).some(b => b.includes('¿Te mando el catálogo'))).toBe(true);
+  });
+});

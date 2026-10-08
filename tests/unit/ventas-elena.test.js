@@ -128,8 +128,8 @@ describe('prompt de ventas', () => {
     for (const p of [ws, ig]) {
       expect(p).toContain('MUESTRA EL CATÁLOGO Y ENTIENDE QUÉ BUSCA');
       expect(p).not.toMatch(/antoj/i);
-      expect(p).toMatch(/"quiero ver camas".*llama enviar_catalogo de esa categoría DE UNA VEZ/s);
-      expect(p).toMatch(/MISMO mensaje arranca la conversación con UNA pregunta/);
+      expect(p).toMatch(/"quiero ver camas".*tu PRIMER paso es LLAMAR la herramienta enviar_catalogo/s);
+      expect(p).toMatch(/arranca la conversación con UNA pregunta clave/);
     }
   });
 
@@ -186,5 +186,121 @@ describe('prompt de ventas', () => {
   test('ningún hueco sin rellenar', () => {
     expect(ws).not.toMatch(/undefined|null%/);
     expect(ig).not.toMatch(/undefined|null%/);
+  });
+});
+
+describe('aviso por turno para pedir nombre y celular (memoria.notaPedirDatos)', () => {
+  const memoria = require('../../memoria');
+  const hist = (...m) => m.map(([role, content]) => ({ role, content }));
+
+  test('en el primer mensaje no: primero se atiende', () => {
+    expect(memoria.notaPedirDatos({ perfil: null, historial: [] })).toBeNull();
+  });
+  test('desde el segundo mensaje, si no sabe el nombre, toca pedirlo', () => {
+    const nota = memoria.notaPedirDatos({ perfil: null, historial: hist(['user', 'quiero ver camas'], ['assistant', 'Aquí tienes el catálogo']) });
+    expect(nota).toMatch(/TODAVÍA NO SABES EL NOMBRE/);
+    expect(nota).toMatch(/guardar_contacto/);
+  });
+  test('no se pide si ya sabe el nombre, si dijo que no o si ya se lo pidió', () => {
+    const h = hist(['user', 'hola'], ['assistant', 'Hola']);
+    expect(memoria.notaPedirDatos({ perfil: { nombre: 'Ana' }, historial: h })).toBeNull();
+    expect(memoria.notaPedirDatos({ perfil: { no_quiso_dar_datos: true }, historial: h })).toBeNull();
+    expect(memoria.notaPedirDatos({ perfil: { datos_pedidos: true }, historial: h })).toBeNull();
+    expect(memoria.notaPedirDatos({ perfil: null, historial: hist(['user', 'hola'], ['assistant', 'Por cierto, ¿con quién tengo el gusto?']) })).toBeNull();
+  });
+  test('reconoce cuándo Elena pidió los datos', () => {
+    expect(memoria.pidioDatos('¿Con quién tengo el gusto? 😊')).toBe(true);
+    expect(memoria.pidioDatos('Te mando fotos de cerca')).toBe(false);
+  });
+});
+
+describe('repaso final del prompt', () => {
+  const ws = construirSystemPrompt('whatsapp');
+  test('el prompt termina con el repaso de lo que más se le olvidaba al modelo', () => {
+    const repaso = ws.slice(ws.lastIndexOf('ANTES DE ENVIAR CADA RESPUESTA, REVISA'));
+    expect(ws.endsWith(repaso)).toBe(true);
+    expect(repaso).toMatch(/sin haber llamado la herramienta/);
+    expect(repaso).toMatch(/enlace que no me dio una herramienta/);
+    expect(repaso).toMatch(/agregar_al_carrito ya/);
+    expect(repaso).toMatch(/nunca solo una despedida/);
+  });
+  test('no hay frases de ejemplo de catálogo que se puedan copiar sin llamar la herramienta', () => {
+    expect(ws).not.toMatch(/"¡Claro! Aquí tienes nuestro catálogo/);
+    expect(ws).toMatch(/tu PRIMER paso es LLAMAR la herramienta enviar_catalogo/);
+  });
+});
+
+describe('evaluador: nota por turno y cada caso desde cero', () => {
+  const runner = require('../../evaluacion/runner');
+  test('la nota llega como mensaje de sistema solo en su turno y no queda en el historial', async () => {
+    const vistos = [];
+    const openai = { chat: { completions: { create: async ({ messages }) => {
+      vistos.push(messages.map(m => m.content));
+      return { choices: [{ message: { content: 'ok' } }] };
+    } } } };
+    await runner.ejecutarCaso({ mensajes: ['a', 'b'] }, {
+      openai, modelo: 'x', systemPrompt: 'PROMPT', tools: [], ejecutarHerramienta: async () => ({}),
+      notaPorTurno: ({ historial }) => (historial.length ? 'NOTA' : null),
+    });
+    expect(vistos[0]).toEqual(['PROMPT', 'a']);
+    expect(vistos[1]).toEqual(['PROMPT', 'NOTA', 'a', 'ok', 'b']);
+  });
+  test('alEmpezarCaso se llama una vez por caso', async () => {
+    let n = 0;
+    const openai = { chat: { completions: { create: async () => ({ choices: [{ message: { content: 'ok' } }] }) } } };
+    await runner.evaluarTodos([{ id: '1', mensajes: ['a'] }, { id: '2', mensajes: ['b'] }], {
+      openai, modelo: 'x', systemPrompt: 'P', tools: [], ejecutarHerramienta: async () => ({}), alEmpezarCaso: () => { n++; },
+    });
+    expect(n).toBe(2);
+  });
+});
+
+describe('revisión antes de enviar (verificacion.js)', () => {
+  const { revisarRespuesta } = require('../../verificacion');
+
+  test.each([
+    ['¡Claro! Te envío el catálogo de camas.', [], /catálogo/],
+    ['Aquí tienes nuestro catálogo de camas 😊', [], /enviar_catalogo/],
+    ['Voy a notificar a nuestro equipo de compras sobre tu propuesta.', [], /reportar_proveedor/],
+    ['Listo, ya la agregué al carrito 🛒', [], /agregar_al_carrito/],
+    ['Ya quedó agendada tu cita para el sábado.', [], /agendar_cita/],
+  ])('"%s" sin la herramienta se corrige', (texto, herramientas, esperado) => {
+    expect(revisarRespuesta({ texto, herramientas, resultados: [] })).toMatch(esperado);
+  });
+
+  test('con la herramienta llamada en el turno, pasa', () => {
+    expect(revisarRespuesta({
+      texto: 'Aquí tienes nuestro catálogo de camas: https://sistema-de-ventas-olive.vercel.app/catalogo/camas',
+      herramientas: ['enviar_catalogo'],
+      resultados: [{ exito: true, url: 'https://sistema-de-ventas-olive.vercel.app/catalogo/camas' }],
+    })).toBeNull();
+    expect(revisarRespuesta({ texto: 'Ya notifiqué al equipo de compras 😊', herramientas: ['reportar_proveedor'] })).toBeNull();
+  });
+
+  test('las preguntas son ofrecimientos, no promesas', () => {
+    expect(revisarRespuesta({ texto: '¿Te envío el catálogo de camas? ¿O te mando fotos de cerca?', herramientas: [] })).toBeNull();
+  });
+
+  test('un enlace que no devolvió ninguna herramienta es inventado', () => {
+    const r = revisarRespuesta({ texto: 'Mira: [Catálogo](https://www.decasa.com/catalogo/camas)', herramientas: ['enviar_catalogo'], resultados: [{ url: 'https://sistema-de-ventas-olive.vercel.app/catalogo/camas' }] });
+    expect(r).toMatch(/decasa\.com\/catalogo\/camas/);
+    expect(r).toMatch(/inventado/);
+  });
+
+  test('el evaluador aplica la misma revisión, una vez por turno', async () => {
+    const runner = require('../../evaluacion/runner');
+    const respuestas = ['Te envío el catálogo de camas.', '¿Las buscas dobles o queen?'];
+    const openai = { chat: { completions: { create: async () => ({ choices: [{ message: { content: respuestas.shift() } }] }) } } };
+    const turnos = await runner.ejecutarCaso({ mensajes: ['busco una cama'] }, {
+      openai, modelo: 'x', systemPrompt: 'P', tools: [], ejecutarHerramienta: async () => ({}), revisarRespuesta,
+    });
+    expect(turnos[0].respuesta).toBe('¿Las buscas dobles o queen?');
+  });
+});
+
+describe('nota de venta por categoría', () => {
+  test('las bases de comedor traen "las sillas se venden aparte"; otras categorías no', () => {
+    expect(negocio.notaDeVenta('bases_comedores')).toMatch(/Sillas se venden por UNIDAD/);
+    expect(negocio.notaDeVenta('camas')).toBeNull();
   });
 });
