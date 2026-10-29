@@ -434,7 +434,10 @@ function validateTwilioRequest(req, res, next) {
   }
   const twilioSignature = req.headers['x-twilio-signature'];
   if (!twilioSignature) {
-    if (req.body?.From) return res.status(403).send('Forbidden');
+    if (req.body?.From) {
+      console.warn('[seguridad] Webhook rechazado: llegó sin firma de Twilio (no viene de Twilio).');
+      return res.status(403).send('Forbidden');
+    }
     return next();
   }
   const host = req.headers['x-forwarded-host'] || req.get('host');
@@ -443,7 +446,12 @@ function validateTwilioRequest(req, res, next) {
   const isValid = twilio.validateRequest(
     process.env.TWILIO_AUTH_TOKEN, twilioSignature, url, req.body
   );
-  if (!isValid) return res.status(403).send('Forbidden');
+  // Antes se rechazaba en silencio y un TWILIO_AUTH_TOKEN equivocado se veía como "no pasa
+  // nada" (caso real del 2026-10-29): ni un rastro en los logs de Render.
+  if (!isValid) {
+    console.warn(`[seguridad] Webhook rechazado: la firma de Twilio no coincide (url=${url}). Revisa que TWILIO_AUTH_TOKEN sea el de la misma cuenta que TWILIO_ACCOUNT_SID y que la URL configurada en Twilio sea exactamente esa.`);
+    return res.status(403).send('Forbidden');
+  }
   next();
 }
 
