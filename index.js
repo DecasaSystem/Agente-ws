@@ -73,6 +73,7 @@ const { crearRevisionSistema } = require('./contrato-bd');
 const { analizarVariantes, precioMinimoCombinado, infoVentaPorJuego } = require('./precio-variantes');
 const reintentos = require('./reintentos');
 const negocio = require('./negocio');
+const promociones = require('./promociones');
 const horario = require('./horario');
 const { construirSystemPrompt } = require('./prompt');
 const vigilancia = require('./vigilancia');
@@ -99,7 +100,7 @@ let inventario = {};
 const catalogos = crearCatalogos({
   pool: db.pool,
   respaldo: knowledge.catalogos || {},
-  opciones: { urlBase: negocio.urlCatalogoPublico, mapaCategoriasBD: negocio.mapaCategoriasBD, etiquetas: negocio.CATEGORIAS },
+  opciones: { urlBase: negocio.urlCatalogoPublico, mapaCategoriasBD: negocio.mapaCategoriasBD, etiquetas: negocio.CATEGORIAS, alias: negocio.aliasCatalogos },
   alertar,
 });
 // Precios válidos conocidos del inventario, para detectar precios inventados por Elena.
@@ -381,15 +382,16 @@ function encolar(telefono, tarea) {
 
 // Punto de entrada desde el webhook. Acumula lo que llegue dentro de la ventana y lo
 // procesa una sola vez.
-function recibirMensaje({ from, toNumber, texto, mediaUrl, mediaType, profileName }) {
+function recibirMensaje({ from, toNumber, texto, mediaUrl, mediaType, profileName, respondeA = null }) {
   let buf = _buffers.get(from);
   if (!buf) {
-    buf = { textos: [], media: null, toNumber, profileName: null, timer: null };
+    buf = { textos: [], media: null, toNumber, profileName: null, respondeA: null, timer: null };
     _buffers.set(from, buf);
   }
 
   if (toNumber) buf.toNumber = toNumber;
   if (profileName) buf.profileName = profileName;
+  if (respondeA) buf.respondeA = respondeA;
   if (texto) buf.textos.push(texto);
   // Si en la misma ráfaga llegan varios adjuntos se conserva el último; lo normal es
   // uno solo por turno, y el texto que lo acompaña sí se acumula entero.
@@ -405,6 +407,7 @@ function recibirMensaje({ from, toNumber, texto, mediaUrl, mediaType, profileNam
       mediaUrl:    buf.media?.mediaUrl ?? null,
       mediaType:   buf.media?.mediaType ?? null,
       profileName: buf.profileName,
+      respondeA:   buf.respondeA,
     }).catch(e => {
       console.error('[ERROR] procesarMensaje:', e.message, e.stack?.split('\n')[1]);
       alertar('procesarMensaje falló', `${from} — ${e.message}`);
@@ -745,10 +748,11 @@ async function enviarTexto(from, toNumber, texto) {
     // Con reintentos: un 5xx o un rate limit puntual de Twilio dejaba al cliente sin
     // respuesta aunque el turno se hubiera completado entero.
     for (const parte of trocearTexto(String(texto).trim())) {
-      await conReintentos(
+      const enviado = await conReintentos(
         () => cliente.messages.create({ from: desde, to: from, body: parte }),
         { intentos: 3, baseMs: 600, contexto: `twilio texto ${from}` }
       );
+      anotarEnviado({ sid: enviado?.sid, telefono: from, texto: parte });
     }
     return true;
   } catch (e) {
@@ -758,13 +762,24 @@ async function enviarTexto(from, toNumber, texto) {
   }
 }
 
-// Envía un mensaje adicional via Twilio (para fotos de productos y catálogos)
-async function enviarMensajeAdicional(from, toNumber, body, mediaUrl) {
+// Anota por su SID lo que Elena mandó, para entender después a qué "responde" el cliente
+// (contextoDeRespuesta). En segundo plano y sin fallar nunca: no puede frenar ni tumbar un envío.
+function anotarEnviado(datos) {
+  if (!datos.sid) return;
+  Promise.resolve()
+    .then(() => db.registrarMensajeEnviado(datos))
+    .catch(e => console.warn('[TWILIO] no se pudo anotar el mensaje enviado:', e.message));
+}
+
+// Envía un mensaje adicional via Twilio (para fotos de productos y catálogos). `producto`
+// es el nombre del producto de la foto, si lo es.
+async function enviarMensajeAdicional(from, toNumber, body, mediaUrl, producto = null) {
   try {
     const msg = { from: numeroSalida(toNumber), to: from };
     if (body) msg.body = body;
     if (mediaUrl) msg.mediaUrl = [mediaUrl];
-    await getTwilioClient().messages.create(msg);
+    const enviado = await getTwilioClient().messages.create(msg);
+    anotarEnviado({ sid: enviado?.sid, telefono: from, producto, imagenUrl: mediaUrl ?? null, texto: body ?? null });
   } catch (e) {
     console.error('[TWILIO] Error enviando mensaje adicional:', e.message, e.code || '', e.status || '');
   }
@@ -825,28 +840,73 @@ function infoPrecioVariantes(p) {
 // (5 %, ver negocio.json). La cuenta la hace el código: Elena solo repite la cifra, y como
 // sale de una herramienta, validarPrecios la reconoce como precio válido. Los productos
 // cuyo precio depende de una combinación de opciones no lo llevan: ese precio lo da un asesor.
-function conPrecioEfectivo(info) {
-  if (!negocio.porcentajeDescuentoEfectivo || info.precio_requiere_asesor) return info;
+// Tampoco lo llevan los que no están en existencia: lo que se fabrica no tiene descuento
+// (dueño, 2026-10-20); en su lugar va nota_descuento para que Elena lo explique.
+function conPrecioEfectivo(info, producto) {
+  // Promociones del sistema de ventas (core/promociones.js): todas las vigentes del producto
+  // van en `promociones` (con tiendas y hasta cuándo). Si una le toca a la versión y está en
+  // existencia, el precio que vale es `precio_promocion` y el 5 % se calcula sobre él.
+  const promos = producto ? promociones.resumenPromociones(producto) : [];
+  const conPromos = r => (promos.length ? { ...r, promociones: promos } : r);
+  if (info.precio_requiere_asesor) return conPromos(info);
+  const descuento = Boolean(negocio.porcentajeDescuentoEfectivo) && negocio.aplicaDescuentoEfectivo(producto);
+  const nota = negocio.porcentajeDescuentoEfectivo && !descuento ? negocio.notaSinDescuento(producto) : null;
+  const precios = (lista, variante) => {
+    const r = producto ? promociones.promoPara(producto, variante) : null;
+    const final = r?.aplica ? r.precioPromo : lista;
+    const efectivo = descuento ? negocio.conDescuentoEfectivo(final) : null;
+    return { promo: r?.aplica ? final : null, efectivo };
+  };
+  let out = info;
   if (info.precio) {
-    const efectivo = negocio.conDescuentoEfectivo(parsearPrecio(info.precio));
-    return efectivo ? { ...info, precio_pagando_efectivo: formatearMoneda(efectivo) } : info;
-  }
-  if (Array.isArray(info.variantes)) {
-    return {
+    const x = precios(parsearPrecio(info.precio), null);
+    out = {
+      ...info,
+      ...(x.promo && { precio_promocion: formatearMoneda(x.promo) }),
+      ...(x.efectivo && { precio_pagando_efectivo: formatearMoneda(x.efectivo) }),
+    };
+  } else if (Array.isArray(info.variantes)) {
+    out = {
       ...info,
       variantes: info.variantes.map(v => {
-        const efectivo = negocio.conDescuentoEfectivo(Number(v.precio));
-        return efectivo ? { ...v, precio_pagando_efectivo: efectivo } : v;
+        const x = precios(Number(v.precio), (producto?.variantes ?? []).find(o => o.etiqueta === v.opcion) ?? null);
+        return { ...v, ...(x.promo && { precio_promocion: x.promo }), ...(x.efectivo && { precio_pagando_efectivo: x.efectivo }) };
       }),
     };
   }
-  return info;
+  if (nota) out = { ...out, nota_descuento: nota };
+  return conPromos(out);
 }
 
-// Total del carrito con el descuento por forma de pago, ya formateado (o nada).
-function totalConDescuento(total) {
-  const efectivo = negocio.conDescuentoEfectivo(total);
-  return efectivo ? { total_con_descuento_efectivo: formatearMoneda(efectivo), porcentaje_descuento_efectivo: negocio.porcentajeDescuentoEfectivo } : {};
+// Producto del inventario de una línea del carrito. El carrito guarda "NOMBRE (variante)",
+// así que se prueba el nombre tal cual y luego sin el paréntesis final.
+function productoDeItemCarrito(nombreItem) {
+  const base = String(nombreItem ?? '').replace(/\s*\([^)]*\)\s*$/, '');
+  for (const nombre of [nombreItem, base]) {
+    const n = normalizarTexto(nombre);
+    for (const cat of Object.values(inventario)) {
+      const prod = (cat.productos || []).find(p => normalizarTexto(p.nombre) === n);
+      if (prod) return prod;
+    }
+  }
+  return null;
+}
+
+// Total del carrito con el descuento por forma de pago, ya formateado (o nada). El % solo
+// se aplica a lo que está en existencia (negocio.totalConDescuentoEfectivo); si algo del
+// carrito se fabrica, se le dice al modelo qué quedó sin descuento.
+function totalConDescuento(items) {
+  const r = negocio.totalConDescuentoEfectivo(items.map(i => ({
+    nombre: i.producto,
+    valor: parsearPrecio(i.precio) * (i.cantidad || 1),
+    producto: productoDeItemCarrito(i.producto),
+  })));
+  if (!r) return {};
+  return {
+    total_con_descuento_efectivo: formatearMoneda(r.total),
+    porcentaje_descuento_efectivo: negocio.porcentajeDescuentoEfectivo,
+    ...(r.sinDescuento.length && { sin_descuento_por_fabricacion: r.sinDescuento }),
+  };
 }
 
 // Precio con el que comparar contra el presupuesto del cliente: el más bajo al que
@@ -939,6 +999,10 @@ function buscarEnInventario(consulta, categoria, limite = 6) {
           material: prod.material || null, medidas: prod.medidas || null,
           tieneImagen: !!prod.imagen, imagen: prod.imagen || null, imagen2: prod.imagen2 || null,
           variantes: prod.variantes || [],
+          // Lo que usan la ficha y los precios (descripción, venta por juego, existencias para
+          // el 5 % y promociones). Antes no se copiaba y la búsqueda los perdía.
+          descripcion: prod.descripcion || '', piezasPorJuego: prod.piezasPorJuego ?? null, precioPieza: prod.precioPieza ?? null,
+          existencias: prod.existencias ?? null, promociones: prod.promociones || [],
           categoria: catKey, categoriaNombre: catData.nombre, score
         });
       }
@@ -952,6 +1016,10 @@ function buscarEnInventario(consulta, categoria, limite = 6) {
       material: p.material || null, medidas: p.medidas || null,
       tieneImagen: !!p.imagen, imagen: p.imagen || null, imagen2: p.imagen2 || null,
       variantes: p.variantes || [],
+          // Lo que usan la ficha y los precios (descripción, venta por juego, existencias para
+          // el 5 % y promociones). Antes no se copiaba y la búsqueda los perdía.
+          descripcion: p.descripcion || '', piezasPorJuego: p.piezasPorJuego ?? null, precioPieza: p.precioPieza ?? null,
+          existencias: p.existencias ?? null, promociones: p.promociones || [],
       categoria, categoriaNombre: inventario[categoria].nombre, score: 0
     }));
   }
@@ -977,6 +1045,10 @@ function buscarEnInventarioPorPresupuesto(presupuestoMax, categoria, limite = 5)
           material: prod.material || null, medidas: prod.medidas || null,
           tieneImagen: !!prod.imagen, imagen: prod.imagen || null, imagen2: prod.imagen2 || null,
           variantes: prod.variantes || [],
+          // Lo que usan la ficha y los precios (descripción, venta por juego, existencias para
+          // el 5 % y promociones). Antes no se copiaba y la búsqueda los perdía.
+          descripcion: prod.descripcion || '', piezasPorJuego: prod.piezasPorJuego ?? null, precioPieza: prod.precioPieza ?? null,
+          existencias: prod.existencias ?? null, promociones: prod.promociones || [],
           categoria: catKey, categoriaNombre: catData.nombre
         });
       }
@@ -1229,7 +1301,7 @@ const TOOLS = [
     type: 'function',
     function: {
       name: 'enviar_catalogo',
-      description: 'Envía al cliente el catálogo de una categoría: el catálogo de esa categoría (los de Gestión → Catálogos, que se ven como revista) y, si no hay, la página en línea de esa categoría con fotos y precios actualizados. Sirve para CUALQUIER categoría que se venda (camas, sofás, comedores, cunas, relojes, bancas…), no solo las de la lista.',
+      description: 'Envía al cliente el catálogo de una categoría: el catálogo de esa categoría (los de Gestión → Catálogos, que se ven como revista) y, si no hay, la página en línea de esa categoría con fotos y precios actualizados. Sirve para CUALQUIER categoría que se venda (camas, sofás, comedores, cunas, relojes, bancas…), no solo las de la lista. Si pide VARIOS a la vez ("el de comedores y el de salas"), llámala una vez por cada catálogo, en el mismo turno.',
       parameters: {
         type: 'object',
         properties: {
@@ -1470,7 +1542,7 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
         encontrados: resultados.length,
         productos: resultados.map(p => ({
           nombre: p.nombre,
-          ...conPrecioEfectivo(infoPrecioVariantes(p)),
+          ...conPrecioEfectivo(infoPrecioVariantes(p), p),
           ...infoVentaPorJuego(p, parsearPrecio(p.precio)),
           material: p.material, medidas: p.medidas,
           // La descripción que escribió el equipo en Inventario: datos reales para responder
@@ -1509,7 +1581,7 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
         presupuesto: formatearMoneda(presupuesto),
         productos: resultados.map(p => ({
           nombre: p.nombre,
-          ...conPrecioEfectivo(infoPrecioVariantes(p)),
+          ...conPrecioEfectivo(infoPrecioVariantes(p), p),
           ...infoVentaPorJuego(p, parsearPrecio(p.precio)),
           material: p.material, medidas: p.medidas,
           // La descripción que escribió el equipo en Inventario: datos reales para responder
@@ -1597,7 +1669,7 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
       return {
         items: itemsFormateados, total: formatearMoneda(total),
         totalNumerico: total, cantidad_items: items.length,
-        ...totalConDescuento(total),
+        ...totalConDescuento(items),
       };
     }
 
@@ -1651,7 +1723,16 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
 
       // Si el modelo pasó un precio distinto al real, se registra: es señal de que está
       // inventando importes y conviene revisar el prompt.
-      if (args.precio && parsearPrecio(args.precio) !== parsearPrecio(precio)) {
+      // Promoción del sistema de ventas: si le toca a esta versión y está en existencia, el
+      // carrito guarda el precio ya rebajado (como Nueva orden) y de qué promoción salió.
+      const promoCarrito = promociones.promoPara(prodInventario, args.variante ? encontrarVariante(prodInventario, args.variante) : null);
+      const precioLista = precio;
+      let promocionCarrito = null;
+      if (promoCarrito?.aplica) {
+        precio = formatearMoneda(promoCarrito.precioPromo);
+        promocionCarrito = `${promoCarrito.promo.nombre || 'Promoción'} ${promociones.textoRebaja(promoCarrito.promo)} (lista ${precioLista})`;
+      }
+      if (args.precio && ![precio, precioLista].some(p => parsearPrecio(args.precio) === parsearPrecio(p))) {
         alertar('Modelo pasó un precio distinto al de la BD en agregar_al_carrito', `tel=${telefono} producto="${nombreReal}" modelo=${args.precio} bd=${precio}`);
       }
 
@@ -1674,13 +1755,13 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
         const total = items.reduce((s, i) => s + parsearPrecio(i.precio) * (i.cantidad || 1), 0);
         return {
           exito: true, mensaje: `Cantidad de "${nombreCarrito}" actualizada a ${nuevaCantidad} unidad${nuevaCantidad > 1 ? 'es' : ''}.`,
-          items_en_carrito: items.length, total_carrito: formatearMoneda(total), ...totalConDescuento(total)
+          items_en_carrito: items.length, total_carrito: formatearMoneda(total), ...totalConDescuento(items)
         };
       }
       // Guardar también como último producto visto (con el nombre real del catálogo,
       // sin la variante, para que enviar_foto siga encontrando su imagen)
       await db.setUltimoProducto(from, { nombre: nombreReal, precio, imagen: prodInventario.imagen || null, ts: Date.now() });
-      await db.agregarAlCarrito(from, nombreCarrito, precio, Number(cantidad) || 1);
+      await db.agregarAlCarrito(from, nombreCarrito, precio, Number(cantidad) || 1, ...(promocionCarrito ? [{ promocion: promocionCarrito }] : []));
       const itemsActualizados = await db.verCarrito(from);
       const total = itemsActualizados.reduce((s, i) => s + parsearPrecio(i.precio) * (i.cantidad || 1), 0);
 
@@ -1695,9 +1776,9 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
       }).catch(e => console.warn('[seguimientos] carrito abandonado no programado:', e.message));
 
       return {
-        exito: true, mensaje: `${nombreCarrito} agregado al carrito por ${precio}.`,
+        exito: true, mensaje: `${nombreCarrito} agregado al carrito por ${precio}${promocionCarrito ? ` (en promoción: ${promocionCarrito})` : ''}.`,
         variante: etiquetaVariante,
-        items_en_carrito: itemsActualizados.length, total_carrito: formatearMoneda(total), ...totalConDescuento(total)
+        items_en_carrito: itemsActualizados.length, total_carrito: formatearMoneda(total), ...totalConDescuento(itemsActualizados)
       };
     }
 
@@ -1761,7 +1842,7 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
         const cant = item.cantidad || 1;
         const precio = parsearPrecio(item.precio);
         total += precio * cant;
-        return `${i + 1}. ${item.producto} - ${item.precio}${cant > 1 ? ` (${cant} uds)` : ''}`;
+        return `${i + 1}. ${item.producto} - ${item.precio}${cant > 1 ? ` (${cant} uds)` : ''}${item.promocion ? ` [${item.promocion}]` : ''}`;
       });
       for (const item of items) {
         await db.guardarPedido(telefono, item.producto, item.precio, item.cantidad || 1);
@@ -1783,8 +1864,13 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
       // Si dijo que paga en efectivo o transferencia, el total con el descuento (lo calcula
       // el código) va en el mensaje y en la tarjeta: el asesor ve lo que se le prometió.
       const pagaConDescuento = /efectivo|transfer|consignaci|nequi|daviplata/i.test(String(args.forma_pago ?? ''));
-      const totalEfectivo = pagaConDescuento ? negocio.conDescuentoEfectivo(total) : null;
-      const lineaEfectivo = totalEfectivo ? `Con ${negocio.porcentajeDescuentoEfectivo}% de descuento por pago en efectivo/transferencia: ${formatearMoneda(totalEfectivo)}` : null;
+      // Solo lo que está en existencia lleva el descuento (lo que se fabrica, no).
+      const descPedido = pagaConDescuento
+        ? negocio.totalConDescuentoEfectivo(items.map(i => ({ nombre: i.producto, valor: parsearPrecio(i.precio) * (i.cantidad || 1), producto: productoDeItemCarrito(i.producto) })))
+        : null;
+      const totalEfectivo = descPedido?.total ?? null;
+      const sinDescuentoPedido = descPedido?.sinDescuento?.length ? descPedido.sinDescuento.join(', ') : '';
+      const lineaEfectivo = totalEfectivo ? `Con ${negocio.porcentajeDescuentoEfectivo}% de descuento por pago en efectivo/transferencia: ${formatearMoneda(totalEfectivo)}${sinDescuentoPedido ? ` (sin descuento por ser para fabricar: ${sinDescuentoPedido})` : ''}` : null;
       const datosCierre = [
         contacto.lineaContacto(contactoPedido),
         [args.ciudad && `Entrega en: ${String(args.ciudad).slice(0, 80)}`, args.forma_pago && `Pago: ${String(args.forma_pago).slice(0, 40)}`].filter(Boolean).join(' · '),
@@ -1802,7 +1888,7 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
         resumen: resumenItems.join('\n'),
         total: formatearMoneda(total),
         ...(totalEfectivo && { total_con_descuento_efectivo: formatearMoneda(totalEfectivo) }),
-        mensaje_confirmacion: `¡Pedido confirmado! 🎉\n\n${resumenItems.join('\n')}\n\n*Total: ${formatearMoneda(total)}*${totalEfectivo ? `\n*Pagando en efectivo o transferencia (${negocio.porcentajeDescuentoEfectivo}% de descuento): ${formatearMoneda(totalEfectivo)}*` : ''}\n\nUn asesor de ${negocio.nombreEmpresa} te contactará pronto para coordinar el pago y la entrega. ¡Gracias por elegir ${negocio.nombreEmpresa}! 😊`,
+        mensaje_confirmacion: `¡Pedido confirmado! 🎉\n\n${resumenItems.join('\n')}\n\n*Total: ${formatearMoneda(total)}*${totalEfectivo ? `\n*Pagando en efectivo o transferencia (${negocio.porcentajeDescuentoEfectivo}% de descuento): ${formatearMoneda(totalEfectivo)}*${sinDescuentoPedido ? `\n_Sin descuento (se fabrica sobre pedido): ${sinDescuentoPedido}_` : ''}` : ''}\n\nUn asesor de ${negocio.nombreEmpresa} te contactará pronto para coordinar el pago y la entrega. ¡Gracias por elegir ${negocio.nombreEmpresa}! 😊`,
         aviso_horario: avisoHorarioPedido,
         instruccion_ia: `Comparte el mensaje_confirmacion tal cual al cliente, sin cambiar nada. Luego solo añade una frase corta de despedida.${avisoHorarioPedido ? ' Y como es fuera de horario, avísale que un asesor lo contactará en el próximo horario hábil para que no espere.' : ''}`
       };
@@ -1848,11 +1934,21 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
         await actualizarPerfil(from, { categorias_interes: [String(categoria).trim().toLowerCase()] });
         sincronizarClienteRed(from);
       }
+      // Las promociones de esa categoría van con el catálogo: el asesor las dice sin que se
+      // las pregunten ("tenemos 20 % en los existentes", caso real del 2026-10-29).
+      const productosCat = Object.entries(inventario)
+        .filter(([clave, cat]) => catalogos.delPedido(categoria ?? '', [clave, cat.nombre], encontrado.nombre))
+        .flatMap(([, cat]) => cat.productos || []);
+      const promosCat = promociones.promocionesDeProductos(productosCat);
       return {
         exito: true,
         url: encontrado.url,
         categoria: encontrado.nombre,
         ...(encontrado.fuente === 'inventario' && { nota: 'Es la página en línea de esa categoría, con fotos y precios actualizados. Preséntalo así (no como un PDF).' }),
+        ...(promosCat.length && {
+          promociones_vigentes: promosCat,
+          nota_promociones: 'Menciónale en este mismo mensaje, en una frase y sin que lo pregunte, que hay promoción en estos productos que están en existencia (con la rebaja y en qué tiendas), para que aproveche.',
+        }),
       };
     }
 
@@ -2299,6 +2395,7 @@ async function runAgentLoop(from, mensajeUsuario, opciones = {}) {
   // Para la revisión antes de enviar (verificacion.js): qué herramientas se llamaron en el
   // turno y qué devolvieron. Una sola corrección por turno.
   const herramientasTurno = [];
+  let productoTurno = null; // del que se habló, para el "¿pudiste pensarlo?" de mañana
   const resultadosTurno = [];
   let yaCorregida = false;
 
@@ -2352,6 +2449,7 @@ async function runAgentLoop(from, mensajeUsuario, opciones = {}) {
 
         const resultadoStr = JSON.stringify(resultado);
         herramientasTurno.push(toolCall.function.name);
+        if (seguimientos.HERRAMIENTAS_DE_INTERES.has(toolCall.function.name)) productoTurno = seguimientos.productoDeArgs(toolArgs) ?? productoTurno;
         resultadosTurno.push(resultadoStr);
         for (const n of extraerPrecios(resultadoStr)) preciosVistos.add(n);
         messages.push({
@@ -2389,6 +2487,15 @@ async function runAgentLoop(from, mensajeUsuario, opciones = {}) {
       // Si en esta respuesta le pidió los datos, no se los vuelve a pedir por su cuenta.
       if (notaDatos && memoria.pidioDatos(texto)) actualizarPerfil(from, { datos_pedidos: true }).catch(() => {});
       logUsoTokens(from, tokPrompt, tokCompletion, ronda + 1, etiqueta, tokCacheados);
+      // Le mostró productos y no cerró nada: si se queda callado, mañana Elena lo retoma
+      // (seguimientos.debeProgramarInteres). Se corre con cada turno así.
+      if (seguimientos.debeProgramarInteres(herramientasTurno)) {
+        Promise.all([db.verCarrito(from), db.getNombreCliente(from).catch(() => null)])
+          .then(([carrito, nombre]) => seguimientos.programarInteresPendiente(depsSeguimientos(), {
+            destinatario: from.replace('whatsapp:', ''), producto: productoTurno, nombre, tieneCarrito: (carrito || []).length > 0,
+          }))
+          .catch(e => console.warn('[seguimientos] interés pendiente no programado:', e.message));
+      }
       return { texto, imagenesParaEnviar };
     }
   }
@@ -2484,7 +2591,7 @@ async function analizarImagenCliente({ from, toNumber, mediaUrl, mediaType, text
   const entregado = await enviarTexto(from, toNumber, texto);
   if (entregado) await db.addMensaje(from, 'assistant', texto);
   for (const img of imagenesParaEnviar) {
-    await enviarMensajeAdicional(from, toNumber, `📸 ${img.nombre}`, img.url);
+    await enviarMensajeAdicional(from, toNumber, `📸 ${img.nombre}`, img.url, img.nombre);
   }
 }
 
@@ -2509,6 +2616,8 @@ app.post('/webhook', (req, res) => {
   // webhook y antes se descartaba, así que el asesor recibía la solicitud con el número
   // pelado aunque el nombre viniera gratis.
   const profileName = (req.body.ProfileName || '').trim();
+  // El cliente deslizó y "respondió" a un mensaje nuestro (casi siempre una foto).
+  const respondeA = req.body.OriginalRepliedMessageSid || null;
 
   res.status(200).send('');
 
@@ -2535,15 +2644,36 @@ app.post('/webhook', (req, res) => {
         log.info('sid_duplicado', { cliente: from, sid: messageSid, origen: 'bd' });
         return;
       }
-      recibirMensaje({ from, toNumber, texto: incomingMsg, mediaUrl, mediaType, profileName });
+      recibirMensaje({ from, toNumber, texto: incomingMsg, mediaUrl, mediaType, profileName, respondeA });
     })
     .catch(e => {
       // Ante un fallo de BD se procesa igual: mejor arriesgar un duplicado que perder el
       // mensaje del cliente.
       console.error('[DEDUP] no se pudo registrar el SID, se procesa igual:', e.message);
-      recibirMensaje({ from, toNumber, texto: incomingMsg, mediaUrl, mediaType, profileName });
+      recibirMensaje({ from, toNumber, texto: incomingMsg, mediaUrl, mediaType, profileName, respondeA });
     });
 });
+
+// Qué le decimos al modelo cuando el cliente responde a un mensaje de Elena
+// (OriginalRepliedMessageSid). Devuelve { ctx } para el modelo y { corto } para el
+// historial. El precio no va aquí: si lo necesita, lo saca de buscar_productos.
+async function contextoDeRespuesta(telefono, sid) {
+  const previo = await db.getMensajeEnviado(sid, telefono);
+  let ctx;
+  let corto;
+  if (previo?.producto) {
+    ctx = `[El cliente está RESPONDIENDO a la foto de ${previo.producto} que le enviaste: se refiere a ESE producto. Si necesitas su precio o sus datos, llama buscar_productos con ese nombre exacto.]`;
+    corto = `[respondiendo a la foto de ${previo.producto}]`;
+  } else if (previo?.texto) {
+    ctx = `[El cliente está respondiendo a este mensaje tuyo: "${previo.texto}"]`;
+    corto = `[respondiendo a: "${previo.texto.substring(0, 80)}"]`;
+  } else {
+    ctx = '[El cliente está respondiendo a una foto o mensaje anterior nuestro que no podemos ver. Si por la conversación no queda claro de qué producto habla, NO adivines: pregúntale con amabilidad cuál es (el nombre, o que te reenvíe la foto o una captura).]';
+    corto = '[respondiendo a un mensaje anterior]';
+  }
+  log.info('respuesta_a_mensaje', { encontrado: Boolean(previo), con_producto: Boolean(previo?.producto) });
+  return { ctx, corto };
+}
 
 // Procesa un turno completo del cliente (ya agrupado por el buffer de ráfagas).
 async function procesarMensaje(datos) {
@@ -2553,7 +2683,7 @@ async function procesarMensaje(datos) {
   return log.conContexto({ canal: 'whatsapp', cliente: datos.from }, () => _procesarMensaje(datos));
 }
 
-async function _procesarMensaje({ from, toNumber, incomingMsg, mediaUrl, mediaType, profileName }) {
+async function _procesarMensaje({ from, toNumber, incomingMsg, mediaUrl, mediaType, profileName, respondeA = null }) {
   try {
     // Cuánto llevaba el cliente sin escribir, medido ANTES de que getOrCreateUsuario
     // refresque last_interaction. runAgentLoop lo usa para que Elena retome la
@@ -2713,9 +2843,13 @@ async function _procesarMensaje({ from, toNumber, incomingMsg, mediaUrl, mediaTy
         log.info('audio_transcrito', { texto: textoTranscrito.substring(0, 120) });
 
         const historialAudio = await db.getHistorial(from, 12);
-        const resultadoAudio = await runAgentLoop(from, textoTranscrito, { historial: historialAudio, etiqueta: 'audio' });
+        const respuestaAudio = respondeA ? await contextoDeRespuesta(from, respondeA) : null;
+        const resultadoAudio = await runAgentLoop(
+          from, respuestaAudio ? `${respuestaAudio.ctx}\n${textoTranscrito}` : textoTranscrito,
+          { historial: historialAudio, etiqueta: 'audio' }
+        );
 
-        await db.addMensaje(from, 'user', `🎤 ${textoTranscrito}`);
+        await db.addMensaje(from, 'user', `${respuestaAudio ? `${respuestaAudio.corto} ` : ''}🎤 ${textoTranscrito}`);
         // Un asesor tomó el chat mientras se procesaba el audio: no se le envía nada.
         if (resultadoAudio.descartada) return;
         await db.actualizarLastInteraction(from);
@@ -2725,7 +2859,7 @@ async function _procesarMensaje({ from, toNumber, incomingMsg, mediaUrl, mediaTy
         if (entregadoAudio) await db.addMensaje(from, 'assistant', resultadoAudio.texto);
         for (const img of resultadoAudio.imagenesParaEnviar) {
           const caption = `📸 ${img.nombre}`;
-          await enviarMensajeAdicional(from, toNumber, caption, img.url);
+          await enviarMensajeAdicional(from, toNumber, caption, img.url, img.nombre);
         }
       } catch (err) {
         console.error('[AUDIO] Error:', err.message);
@@ -2779,10 +2913,15 @@ async function _procesarMensaje({ from, toNumber, incomingMsg, mediaUrl, mediaTy
     // Sin carrera contra reloj: la respuesta sale por REST cuando esté lista, así que
     // el modelo puede usar todas sus rondas de herramientas (buscar, enviar fotos,
     // consultar carrito) sin que se corte a mitad.
-    const { texto, imagenesParaEnviar, descartada } = await runAgentLoop(from, incomingMsg, { historial: historialPrevio });
+    // Si respondió a una foto o mensaje nuestro, el modelo sabe a cuál (caso real del
+    // 2026-10-29: "Nos gustó este comedor y..." sobre una de varias fotos).
+    const respuestaA = respondeA ? await contextoDeRespuesta(from, respondeA) : null;
+    const { texto, imagenesParaEnviar, descartada } = await runAgentLoop(
+      from, respuestaA ? `${respuestaA.ctx}\n${incomingMsg}` : incomingMsg, { historial: historialPrevio }
+    );
 
     // Guardar en historial
-    await db.addMensaje(from, 'user', incomingMsg);
+    await db.addMensaje(from, 'user', respuestaA ? `${respuestaA.corto} ${incomingMsg}` : incomingMsg);
     // Un asesor tomó el chat mientras la IA generaba la respuesta: queda guardado lo que
     // dijo el cliente (contexto para cuando la IA retome), pero no se le envía nada.
     if (descartada) return;
@@ -2798,7 +2937,7 @@ async function _procesarMensaje({ from, toNumber, incomingMsg, mediaUrl, mediaTy
     // Las imágenes van como mensajes aparte, después del texto
     for (const img of imagenesParaEnviar) {
       const caption = `📸 ${img.nombre}`;
-      await enviarMensajeAdicional(from, toNumber, caption, img.url);
+      await enviarMensajeAdicional(from, toNumber, caption, img.url, img.nombre);
     }
 
   } catch (error) {
@@ -3026,6 +3165,7 @@ async function startServer() {
   setInterval(() => {
     db.limpiarHistorialAntiguo().catch(e => console.error('[DB] limpieza historial:', e.message));
     db.limpiarSidsAntiguos().catch(e => console.error('[DB] limpieza sids:', e.message));
+    db.purgarMensajesEnviados(30).catch(e => console.error('[DB] limpieza mensajes enviados:', e.message));
     db.limpiarGastoAntiguo().catch(e => console.error('[DB] limpieza gasto:', e.message));
   }, 24 * 60 * 60 * 1000);
 
@@ -3075,6 +3215,7 @@ module.exports = {
   app, startServer, TOOLS, extraerPrecios, validarPrecios, setPreciosInventarioParaPruebas,
   // Expuestos para pruebas del buffer de ráfagas y del troceo de mensajes largos.
   recibirMensaje, procesarMensaje, encolar, trocearTexto, DEBOUNCE_MS,
+  contextoDeRespuesta, enviarMensajeAdicional,
   // Expuestos para pruebas de la notificación al sistema de ventas (idempotencia).
   notificarRedes, procesarColaNotificaciones,
   // Expuesto para pruebas de las herramientas (p. ej. consultar_pedidos).

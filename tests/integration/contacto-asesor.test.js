@@ -1,6 +1,7 @@
 // Nombre y celular antes de pasar al cliente con una persona (dueño, 2026-10-08): sin
 // ellos el asesor no sabe a quién llamar y el cliente de redes queda vacío en el sistema.
-// También: el descuento del 5 % por efectivo/transferencia lo calcula el código.
+// También: el descuento del 5 % por efectivo/transferencia lo calcula el código, y solo
+// para lo que está en existencia: lo que se fabrica no lleva descuento (dueño, 2026-10-20).
 
 const mockFetch = jest.fn(async () => ({ ok: true }));
 // El perfil simulado recuerda lo que se guarda, como el de verdad.
@@ -9,6 +10,24 @@ const mockPerfil = jest.fn(async () => perfilActual);
 const mockSetPerfil = jest.fn(async (_de, p) => { perfilActual = p; });
 const mockGuardarPedido = jest.fn(async () => true);
 const mockMarcarTransferida = jest.fn(async () => {});
+// CAMA MIAMI hay en existencia; SOFA NUBE se fabrica sobre pedido.
+const mockInventario = {
+  camas: { nombre: 'Camas', productos: [{ nombre: 'CAMA MIAMI', precio: '$2.980.000', variantes: [], existencias: 2 }] },
+  salas: { nombre: 'Salas', productos: [{ nombre: 'SOFA NUBE', precio: '$3.580.000', variantes: [], existencias: 0 }] },
+  // Promoción de Inventario → Promociones: 15 % en la 1.40, en dos tiendas.
+  comedores: { nombre: 'Comedores', productos: [{
+    nombre: 'CAMA BALI', precio: '$1.500.000', existencias: 3,
+    variantes: [
+      { etiqueta: '1.40', precio: 1500000, tipo: 'Medidas', precioPropio: true, afectaPrecio: true, configId: 10, varianteId: null },
+      { etiqueta: '1.60', precio: 1800000, tipo: 'Medidas', precioPropio: true, afectaPrecio: true, configId: 11, varianteId: null },
+    ],
+    promociones: [{ id: 7, nombre: 'Feria de octubre', config_id: 10, variante_id: null, tipo: 'porcentaje', valor: 15,
+      fecha_inicio: '2026-01-01', fecha_fin: '2099-12-31', tiendas: ['Unicentro', 'Vía El Edén'] }],
+  }] },
+};
+const mockAgregarAlCarrito = jest.fn(async () => true);
+const CARRITO_MIAMI = [{ producto: 'CAMA MIAMI (1.60)', precio: '$2.980.000', cantidad: 1 }];
+const mockVerCarrito = jest.fn(async () => CARRITO_MIAMI);
 
 jest.mock('twilio', () => {
   const fn = jest.fn(() => ({ messages: { create: jest.fn() } }));
@@ -28,7 +47,13 @@ jest.mock('../../httpClient', () => ({ fetchWithRetry: (...a) => mockFetch(...a)
 jest.mock('dotenv', () => ({ config: jest.fn() }));
 jest.mock('../../db', () => ({
   pool: { query: jest.fn(async () => [[]]) },
-  verCarrito: jest.fn(async () => [{ producto: 'CAMA MIAMI (1.60)', precio: '$2.980.000', cantidad: 1 }]),
+  verCarrito: (...a) => mockVerCarrito(...a),
+  getInventarioFromDB: jest.fn(async () => mockInventario),
+  agregarAlCarrito: (...a) => mockAgregarAlCarrito(...a),
+  setUltimoProducto: jest.fn(async () => {}),
+  updateEstado: jest.fn(async () => {}),
+  getUltimosMostrados: jest.fn(async () => []),
+  setUltimosMostrados: jest.fn(async () => {}),
   guardarPedido: (...a) => mockGuardarPedido(...a),
   marcarPedidoConfirmado: jest.fn(async () => {}),
   limpiarCarrito: jest.fn(async () => {}),
@@ -46,7 +71,8 @@ jest.mock('../../db', () => ({
 }));
 
 process.env.DECASA_API_URL = 'https://api.prueba';
-const { ejecutarHerramienta } = require('../../index');
+const { ejecutarHerramienta, cargarInventario } = require('../../index');
+beforeAll(() => cargarInventario());
 const esperar = () => new Promise(r => setTimeout(r, 20));
 const DE = 'whatsapp:+573001112233';
 const avisos = () => mockFetch.mock.calls
@@ -59,6 +85,7 @@ beforeEach(() => {
   mockMarcarTransferida.mockClear();
   mockSetPerfil.mockClear();
   perfilActual = null;
+  mockVerCarrito.mockImplementation(async () => CARRITO_MIAMI);
   mockPerfil.mockImplementation(async () => perfilActual);
 });
 
@@ -141,6 +168,23 @@ describe('confirmar_pedido', () => {
     expect(r.total_con_descuento_efectivo).toBeUndefined();
     expect(r.mensaje_confirmacion).not.toMatch(/descuento/);
   });
+
+  test('lo que se fabrica no lleva descuento: solo se rebaja lo que está en existencia', async () => {
+    mockVerCarrito.mockImplementation(async () => [...CARRITO_MIAMI, { producto: 'SOFA NUBE', precio: '$3.580.000', cantidad: 1 }]);
+    const r = await ejecutarHerramienta('confirmar_pedido', { nombre: 'Laura', telefono_contacto: 'este_mismo', forma_pago: 'transferencia' }, DE, []);
+    await esperar();
+    // 2.980.000 × 95 % + 3.580.000 = 6.411.000
+    expect(r.total_con_descuento_efectivo).toBe('$6.411.000');
+    expect(r.mensaje_confirmacion).toMatch(/Sin descuento \(se fabrica sobre pedido\): SOFA NUBE/);
+    expect(avisos()[0].resumen).toMatch(/sin descuento por ser para fabricar: SOFA NUBE/);
+  });
+
+  test('si todo se fabrica, no hay total con descuento', async () => {
+    mockVerCarrito.mockImplementation(async () => [{ producto: 'SOFA NUBE', precio: '$3.580.000', cantidad: 1 }]);
+    const r = await ejecutarHerramienta('confirmar_pedido', { nombre: 'Laura', telefono_contacto: 'este_mismo', forma_pago: 'efectivo' }, DE, []);
+    expect(r.total_con_descuento_efectivo).toBeUndefined();
+    expect(r.mensaje_confirmacion).not.toMatch(/descuento/);
+  });
 });
 
 test('ver_carrito trae el total pagando en efectivo o transferencia', async () => {
@@ -148,6 +192,13 @@ test('ver_carrito trae el total pagando en efectivo o transferencia', async () =
   expect(r.total).toBe('$2.980.000');
   expect(r.total_con_descuento_efectivo).toBe('$2.831.000');
   expect(r.porcentaje_descuento_efectivo).toBe(5);
+});
+
+test('ver_carrito dice qué quedó sin descuento por fabricarse', async () => {
+  mockVerCarrito.mockImplementation(async () => [...CARRITO_MIAMI, { producto: 'SOFA NUBE', precio: '$3.580.000', cantidad: 1 }]);
+  const r = await ejecutarHerramienta('ver_carrito', {}, DE, []);
+  expect(r.total_con_descuento_efectivo).toBe('$6.411.000');
+  expect(r.sin_descuento_por_fabricacion).toEqual(['SOFA NUBE']);
 });
 
 describe('guardar_contacto: el cliente queda en Clientes → Redes apenas da sus datos', () => {
@@ -201,5 +252,38 @@ describe('guardar_contacto: el cliente queda en Clientes → Redes apenas da sus
     await esperar();
     expect(r.exito).toBe(true);
     expect(avisos()[0].contacto).toMatchObject({ nombre: 'Carolina', telefono: '+573104445566' });
+  });
+});
+
+describe('promociones del sistema de ventas', () => {
+  test('al agregar la 1.40 queda con el precio de promoción y dice de cuál salió', async () => {
+    mockAgregarAlCarrito.mockClear();
+    const r = await ejecutarHerramienta('agregar_al_carrito', { producto: 'CAMA BALI', variante: '1.40' }, DE, []);
+    expect(r.exito).toBe(true);
+    expect(mockAgregarAlCarrito).toHaveBeenCalledWith(DE, 'CAMA BALI (1.40)', '$1.275.000', 1, { promocion: 'Feria de octubre −15 % (lista $1.500.000)' });
+    expect(r.mensaje).toMatch(/en promoción: Feria de octubre/);
+  });
+
+  test('la 1.60 no está en promoción: va a precio de lista', async () => {
+    mockAgregarAlCarrito.mockClear();
+    await ejecutarHerramienta('agregar_al_carrito', { producto: 'CAMA BALI', variante: '1.60' }, DE, []);
+    expect(mockAgregarAlCarrito).toHaveBeenCalledWith(DE, 'CAMA BALI (1.60)', '$1.800.000', 1);
+  });
+
+  test('la búsqueda trae la promoción y el 5 % sobre el precio de promoción', async () => {
+    const r = await ejecutarHerramienta('buscar_productos', { consulta: 'cama bali' }, DE, []);
+    const bali = r.productos.find(p => p.nombre === 'CAMA BALI');
+    const v140 = bali.variantes.find(v => v.opcion === '1.40');
+    expect(v140).toMatchObject({ precio: 1500000, precio_promocion: 1275000, precio_pagando_efectivo: 1211250 });
+    expect(bali.variantes.find(v => v.opcion === '1.60').precio_promocion).toBeUndefined();
+    expect(bali.promociones[0]).toMatchObject({ version: '1.40', tiendas: 'Unicentro y Vía El Edén', aplica: true });
+  });
+
+  test('el pedido le dice al asesor con qué promoción entró cada línea', async () => {
+    mockVerCarrito.mockImplementation(async () => [{ producto: 'CAMA BALI (1.40)', precio: '$1.275.000', cantidad: 1, promocion: 'Feria de octubre −15 % (lista $1.500.000)' }]);
+    const r = await ejecutarHerramienta('confirmar_pedido', { nombre: 'Laura', telefono_contacto: 'este_mismo', forma_pago: 'efectivo' }, DE, []);
+    await esperar();
+    expect(r.total_con_descuento_efectivo).toBe('$1.211.250');
+    expect(avisos()[0].resumen).toMatch(/CAMA BALI \(1\.40\) - \$1\.275\.000 \[Feria de octubre −15 %/);
   });
 });

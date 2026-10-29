@@ -10,3 +10,6 @@ baseDatos.sql
 
 # Configuración de un negocio concreto, si se decide no versionarla
 negocio-*.json
+
+# Mapa local del código (graphify): no se versiona
+graphify-out/

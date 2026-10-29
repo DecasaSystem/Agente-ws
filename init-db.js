@@ -8,7 +8,24 @@ const mysql = require('mysql2/promise');
 //     sql: 'CREATE TABLE sugerencias (...)' },
 //
 // Lo que ya existía arriba se queda como está: es idempotente y corre sin problema.
-const MIGRACIONES = [];
+const MIGRACIONES = [
+  // Lo que Elena le mandó a cada cliente (foto o texto), por el SID de Twilio. Cuando el
+  // cliente "responde" a una de esas fotos, Twilio solo trae OriginalRepliedMessageSid: sin
+  // esto Elena no sabía de qué producto le hablaban (caso real del 2026-10-29 en Instagram,
+  // "Nos gustó este comedor y..."). Lo del asesor no pasa por aquí: escribe desde su
+  // propio número. Se borra a los 30 días.
+  { id: 'wa-2026-10-29-mensajes-enviados',
+    descripcion: 'tabla wa_mensajes_enviados: qué foto o texto era cada mensaje de Elena, para entender las respuestas',
+    sql: `CREATE TABLE IF NOT EXISTS wa_mensajes_enviados (
+      sid         VARCHAR(64) PRIMARY KEY,
+      telefono    VARCHAR(40) NOT NULL,
+      producto    VARCHAR(255) NULL,
+      imagen_url  TEXT NULL,
+      texto       VARCHAR(600) NULL,
+      creado      DATETIME DEFAULT CURRENT_TIMESTAMP,
+      INDEX idx_creado (creado)
+    )` },
+];
 
 async function initDB() {
   let connection;

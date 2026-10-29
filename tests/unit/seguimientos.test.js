@@ -46,7 +46,8 @@ function crearDeps(sobrescribir = {}) {
       },
     },
     enviar: async (destinatario, texto) => { enviados.push({ destinatario, texto }); return true; },
-    minutosDesdeUltimoMensaje: async () => 60,          // dentro de la ventana
+    // Callado 21 h: ya pasaron las 20 de los comerciales y sigue dentro de la ventana de 24 h.
+    minutosDesdeUltimoMensaje: async () => 21 * 60,
     hayAsesorAtendiendo: async () => false,
     guardarEnHistorial: async (d, t) => { historial.push({ d, t }); },
     evento: (d, tipo, detalle) => eventos.push({ d, tipo, detalle }),
@@ -234,5 +235,44 @@ describe('Recordatorios de cita', () => {
     await seguimientos.cancelar(deps, { destinatario: CLIENTE, referencia: fecha });
 
     expect(deps._cola.filter(s => s.destinatario === '573009998877' && s.estado === 'pendiente')).toHaveLength(2);
+  });
+});
+
+describe('"No dejes ir al cliente": el ¿pudiste pensarlo? sale solo y espera al silencio', () => {
+  // Caso real del 2026-10-29: la clienta recibió precio y foto, dijo "gracias" y se fue. El
+  // seguimiento solo existía si el modelo reportaba una objeción.
+  test('se programa si se le mostraron productos y no cerró nada', () => {
+    expect(seguimientos.debeProgramarInteres(['buscar_productos', 'enviar_foto'])).toBe(true);
+    expect(seguimientos.debeProgramarInteres(['enviar_catalogo'])).toBe(true);
+    expect(seguimientos.debeProgramarInteres(['buscar_productos', 'agregar_al_carrito'])).toBe(false);
+    expect(seguimientos.debeProgramarInteres(['enviar_foto', 'agendar_cita'])).toBe(false);
+    expect(seguimientos.debeProgramarInteres(['transferir_asesor', 'buscar_productos'])).toBe(false);
+    expect(seguimientos.debeProgramarInteres(['consultar_pedidos'])).toBe(false);
+    expect(seguimientos.debeProgramarInteres([])).toBe(false);
+  });
+
+  test('el producto sale de lo que pidió la herramienta', () => {
+    expect(seguimientos.productoDeArgs({ nombre_producto: 'SOFA MODULAR CONFORT' })).toBe('SOFA MODULAR CONFORT');
+    expect(seguimientos.productoDeArgs({ productos: ['CAMA NUBE', 'CAMA EDEN'] })).toBe('CAMA NUBE');
+    expect(seguimientos.productoDeArgs({ consulta: 'sofá gris' })).toBe('sofá gris');
+    expect(seguimientos.productoDeArgs({ categoria: 'camas' })).toBeNull();
+  });
+
+  test('si el cliente siguió escribiendo, no sale "ayer quedamos…": se corre hasta que cumpla las horas callado', async () => {
+    const deps = crearDeps({ minutosDesdeUltimoMensaje: async () => 60 });
+    await seguimientos.programar(deps, { destinatario: CLIENTE, tipo: 'interes_pendiente', referencia: 'interes', cuando: ayer(), datos: { producto: 'SOFA' } });
+
+    const resumen = await seguimientos.procesarPendientes(deps);
+
+    expect(resumen.enviados).toBe(0);
+    expect(resumen.pospuestos).toBe(1);
+    expect(deps._enviados).toHaveLength(0);
+    expect(deps._cola[0].estado).toBe('pendiente');
+  });
+
+  test('los recordatorios de cita no esperan al silencio', async () => {
+    const deps = crearDeps({ minutosDesdeUltimoMensaje: async () => 60 });
+    await seguimientos.programar(deps, { destinatario: CLIENTE, tipo: 'cita_2h', referencia: 'c1', cuando: ayer(), datos: { dia: 'hoy', hora: '3 pm', sede: 'Bolívar' } });
+    expect((await seguimientos.procesarPendientes(deps)).enviados).toBe(1);
   });
 });

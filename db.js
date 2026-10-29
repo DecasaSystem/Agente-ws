@@ -297,7 +297,9 @@ async function updateEstado(telefono, datos) {
 // CARRITO
 // ─────────────────────────────────────────────
 
-async function agregarAlCarrito(telefono, producto, precio, cantidad = 1) {
+// `extra`: datos de la línea que no cambian su identidad, p. ej. { promocion } (la
+// promoción con la que entró; el precio ya viene rebajado).
+async function agregarAlCarrito(telefono, producto, precio, cantidad = 1, extra = undefined) {
   const estado = await getEstado(telefono);
   const carrito = estado.carrito || [];
 
@@ -305,7 +307,7 @@ async function agregarAlCarrito(telefono, producto, precio, cantidad = 1) {
   if (itemExistente) {
     itemExistente.cantidad = (itemExistente.cantidad || 1) + cantidad;
   } else {
-    carrito.push({ producto, precio, cantidad });
+    carrito.push({ producto, precio, cantidad, ...(extra || {}) });
   }
 
   await updateEstado(telefono, { carrito });
@@ -1211,6 +1213,41 @@ async function contarNotificacionesAtascadas(minIntentos = 3) {
   return rows[0]?.n ?? 0;
 }
 
+// ── Mensajes de Elena (ver la migración wa-2026-10-29-mensajes-enviados) ─────────────
+
+// Nunca lanza: perder esto solo quita contexto cuando el cliente responde a una foto.
+async function registrarMensajeEnviado({ sid, telefono, producto = null, imagenUrl = null, texto = null }) {
+  if (!sid || !telefono) return;
+  try {
+    await pool.query(
+      'INSERT IGNORE INTO wa_mensajes_enviados (sid, telefono, producto, imagen_url, texto) VALUES (?, ?, ?, ?, ?)',
+      [String(sid), String(telefono), producto?.substring(0, 255) ?? null, imagenUrl ?? null, texto?.substring(0, 600) ?? null]
+    );
+  } catch (e) {
+    console.warn('[DB] no se pudo registrar el mensaje enviado:', e.message);
+  }
+}
+
+// El mensaje de Elena con ese SID, solo si se le mandó a ESE cliente (un SID ajeno no
+// debe revelar lo que se le envió a otro). null si no está.
+async function getMensajeEnviado(sid, telefono) {
+  try {
+    const [rows] = await pool.query(
+      'SELECT producto, imagen_url, texto FROM wa_mensajes_enviados WHERE sid = ? AND telefono = ?',
+      [String(sid), String(telefono)]
+    );
+    return rows[0] ?? null;
+  } catch (e) {
+    console.warn('[DB] no se pudo leer el mensaje enviado:', e.message);
+    return null;
+  }
+}
+
+async function purgarMensajesEnviados(dias = 30) {
+  const [r] = await pool.query('DELETE FROM wa_mensajes_enviados WHERE creado < NOW() - INTERVAL ? DAY', [dias]);
+  return r?.affectedRows ?? 0;
+}
+
 async function limpiarSidsAntiguos(dias = 2) {
   try {
     const [res] = await pool.query(
@@ -1346,6 +1383,9 @@ module.exports = {
   contarConversacionesRecientes,
   contarNotificacionesAtascadas,
   limpiarSidsAntiguos,
+  registrarMensajeEnviado,
+  getMensajeEnviado,
+  purgarMensajesEnviados,
   VENTANA_CONVERSACION_MINUTOS,
   TIMEOUT_CARRITO_HORAS,
   registrarEvento,
@@ -1430,6 +1470,63 @@ async function consultarStock(nombreProducto) {
   return rows;
 }
 
+// Unidades libres por producto (disponible − reservada) sumando las sedes activas, la
+// misma cuenta de consultarStock. La usa la regla del descuento: el 5 % por efectivo o
+// transferencia solo aplica a lo que hay en existencia (dueño, 2026-10-20). Si la consulta
+// falla se devuelve null y el agente no ofrece la cifra con descuento.
+// Promociones del sistema de ventas (Inventario → Promociones) que están encendidas y no
+// han terminado, agrupadas por producto, con los nombres de sus tiendas activas. La fecha
+// de hoy se mira al usarlas (core/promociones.js), no aquí. Si la tabla no existe (la
+// migración no ha corrido) o la consulta falla, no hay promociones: se vende a precio de
+// lista, como hace Nueva orden cuando no puede leerlas.
+async function getPromocionesPorProducto() {
+  try {
+    const [rows] = await pool.query(
+      `SELECT pr.id, pr.nombre, pr.producto_id, pr.config_id, pr.variante_id, pr.tipo, pr.valor,
+              DATE_FORMAT(pr.fecha_inicio, '%Y-%m-%d') AS fecha_inicio,
+              DATE_FORMAT(pr.fecha_fin, '%Y-%m-%d')    AS fecha_fin,
+              GROUP_CONCAT(t.nombre ORDER BY t.nombre SEPARATOR '|') AS tiendas
+       FROM promociones pr
+       JOIN promocion_tienda pt ON pt.promocion_id = pr.id
+       JOIN tiendas t           ON t.id = pt.tienda_id AND t.activa = 1
+       WHERE pr.activa = 1 AND pr.fecha_fin >= CURDATE() - INTERVAL 1 DAY
+       GROUP BY pr.id`
+    );
+    const mapa = new Map();
+    for (const r of rows) {
+      if (!mapa.has(r.producto_id)) mapa.set(r.producto_id, []);
+      mapa.get(r.producto_id).push({
+        id: r.id, nombre: r.nombre || null,
+        config_id: r.config_id ?? null, variante_id: r.variante_id ?? null,
+        tipo: r.tipo, valor: Number(r.valor) || 0,
+        fecha_inicio: r.fecha_inicio, fecha_fin: r.fecha_fin,
+        tiendas: String(r.tiendas ?? '').split('|').filter(Boolean),
+      });
+    }
+    return mapa;
+  } catch (e) {
+    console.warn('[inventario] no se pudieron leer las promociones:', e.message);
+    return new Map();
+  }
+}
+
+async function getExistenciasPorProducto() {
+  try {
+    const [rows] = await pool.query(
+      `SELECT i.producto_id,
+              SUM(GREATEST(i.cantidad_disponible - COALESCE(i.cantidad_reservada, 0), 0)) AS libres
+       FROM inventario i
+       JOIN tiendas t ON i.tienda_id = t.id
+       WHERE t.activa = 1
+       GROUP BY i.producto_id`
+    );
+    return new Map(rows.map(r => [r.producto_id, Number(r.libres) || 0]));
+  } catch (e) {
+    console.warn('[inventario] no se pudieron leer las existencias:', e.message);
+    return null;
+  }
+}
+
 async function getInventarioFromDB() {
   let rows;
   try {
@@ -1460,6 +1557,8 @@ async function getInventarioFromDB() {
   }
 
   const variantesPorProducto = await getVariantesPorProducto();
+  const existencias = await getExistenciasPorProducto();
+  const promociones = await getPromocionesPorProducto();
 
   const inventario = {};
   for (const row of rows) {
@@ -1477,7 +1576,10 @@ async function getInventarioFromDB() {
       // Venta por juego (ver precio-variantes.js → infoVentaPorJuego).
       piezasPorJuego: row.piezasPorJuego ?? null,
       precioPieza:    row.precioPieza ?? null,
-      variantes: variantesPorProducto.get(row.id) ?? []
+      variantes: variantesPorProducto.get(row.id) ?? [],
+      // null = no se sabe (ver getExistenciasPorProducto); 0 = se fabrica sobre pedido.
+      existencias: existencias && row.id != null ? (existencias.get(row.id) ?? 0) : null,
+      promociones: promociones.get(row.id) ?? []
     });
   }
   return inventario;
@@ -1520,7 +1622,9 @@ async function getVariantesPorProducto() {
                   ELSE p.precio_base END                       AS precio,
              tv.nombre                                         AS tipo,
              tv.afecta_precio                                  AS afecta_precio,
-             CASE WHEN cfg.precio_adicional > 0 THEN 1 ELSE 0 END AS precio_propio
+             CASE WHEN cfg.precio_adicional > 0 THEN 1 ELSE 0 END AS precio_propio,
+             cfg.id                                            AS config_id,
+             NULL                                              AS variante_id
       FROM producto_variante_configs cfg
       JOIN productos p              ON p.id  = cfg.producto_id AND p.activo = 1
       JOIN tipos_variante tv        ON tv.id = cfg.tipo_variante_id AND tv.activo = 1
@@ -1528,7 +1632,7 @@ async function getVariantesPorProducto() {
 
       UNION ALL
 
-      SELECT v.producto_id, v.medida, v.precio_variante, 'Medidas', 1, 1
+      SELECT v.producto_id, v.medida, v.precio_variante, 'Medidas', 1, 1, NULL, v.id
       FROM producto_variantes v
       JOIN productos p ON p.id = v.producto_id AND p.activo = 1
       WHERE v.activo = 1
@@ -1545,7 +1649,10 @@ async function getVariantesPorProducto() {
         afectaPrecio: Number(r.afecta_precio ?? 0) === 1,
         // precio_adicional > 0: esta opción tiene precio propio (ver precio-variantes.js).
         precioPropio: Number(r.precio_propio ?? 1) === 1,
-      });
+        // A qué apunta una promoción de esta opción o tela (core/promociones.js).
+        configId:   r.config_id ?? null,
+        varianteId: r.variante_id ?? null,
+      });;
     }
 
     // De menor a mayor precio: al cliente se le muestra "desde X" y así la lista queda

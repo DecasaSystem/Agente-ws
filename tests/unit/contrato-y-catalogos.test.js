@@ -254,3 +254,57 @@ describe('revisión del sistema de ventas: sedes y categorías', () => {
     expect(alertar.mock.calls[0][0]).toMatch(/Categorías nuevas/);
   });
 });
+
+describe('alias de catálogos: cómo lo pide el cliente → cómo se llama en Gestión', () => {
+  // Caso real del 2026-10-29: "el catálogo de comedores y salas". "salas" no encontraba
+  // "Sofas y modulares" y Elena recibía "no hay".
+  const { resolverCatalogo } = require('../../catalogos');
+  const negocio = require('../../negocio');
+  const fuentes = { visuales: [
+    { nombre: 'Comedores', slug: 'comedores' }, { nombre: 'Sofas y modulares', slug: 'sofas-y-modulares' },
+    { nombre: 'Sofa camas', slug: 'sofa-camas' }, { nombre: 'Catalogo Oulet', slug: 'catalogo-oulet' },
+    { nombre: 'Sillas de comedor', slug: 'sillas-de-comedor' }, { nombre: 'Sillas de barra', slug: 'sillas-de-barra' },
+  ], secciones: [], herramientas: {} };
+  const opciones = { urlBase: 'https://app', mapaCategoriasBD: negocio.mapaCategoriasBD, etiquetas: negocio.CATEGORIAS, alias: negocio.aliasCatalogos };
+
+  test.each([['salas', 'sofas-y-modulares'], ['sala', 'sofas-y-modulares'], ['Sofás', 'sofas-y-modulares'], ['outlet', 'catalogo-oulet']])(
+    '"%s" → /c/%s', (pedido, slug) => {
+      expect(resolverCatalogo(pedido, fuentes, opciones).url).toBe(`https://app/c/${slug}`);
+    });
+
+  test('lo ambiguo sigue sin adivinarse y lo demás no cambia', () => {
+    expect(resolverCatalogo('sillas', fuentes, opciones)).toBeNull();
+    expect(resolverCatalogo('sofa cama', fuentes, opciones).url).toBe('https://app/c/sofa-camas');
+    expect(resolverCatalogo('comedores', fuentes, opciones).url).toBe('https://app/c/comedores');
+  });
+});
+
+// Las promociones de la categoría van con el catálogo (caso real del 2026-10-29).
+describe('categoriaDelPedido: qué categorías del inventario son las del catálogo enviado', () => {
+  const { categoriaDelPedido } = require('../../catalogos');
+  const promociones = require('../../promociones');
+  const alias = { salas: 'sofas y modulares' };
+
+  test('por lo que pidió o por el nombre del catálogo', () => {
+    expect(categoriaDelPedido('sofa camas', ['sofas_camas', 'Sofá Camas'])).toBe(true);
+    expect(categoriaDelPedido('salas', ['sofas', 'Sofás'], { alias }, 'Sofas y modulares')).toBe(true);
+    expect(categoriaDelPedido('salas', ['modulares'], { alias }, 'Sofas y modulares')).toBe(true);
+  });
+
+  test('no mezcla categorías parecidas', () => {
+    expect(categoriaDelPedido('camas', ['sofas_camas', 'Sofá Camas'], {}, 'Camas')).toBe(false);
+    expect(categoriaDelPedido('sofa camas', ['camas', 'Camas'], {}, 'Sofa camas')).toBe(false);
+  });
+
+  test('promocionesDeProductos: solo lo que está en existencia', () => {
+    const promo = { id: 1, nombre: 'Feria', config_id: null, variante_id: null, tipo: 'porcentaje', valor: 20,
+      fecha_inicio: '2026-01-01', fecha_fin: '2099-12-31', tiendas: ['Unicentro'] };
+    const lineas = promociones.promocionesDeProductos([
+      { nombre: 'SOFACAMA ROMA', precio: 3000000, existencias: 2, variantes: [], promociones: [promo] },
+      { nombre: 'SOFACAMA NUBE', precio: 3380000, existencias: 0, variantes: [], promociones: [promo] },
+      { nombre: 'SOFACAMA LUNA', precio: 2500000, existencias: 1, variantes: [], promociones: [] },
+    ], { hoy: '2026-10-29' });
+    expect(lineas).toHaveLength(1);
+    expect(lineas[0]).toMatch(/^SOFACAMA ROMA: PROMOCIÓN "Feria".*−20 %.*2\.400\.000.*Unicentro/);
+  });
+});
