@@ -253,6 +253,45 @@ describe('revisión del sistema de ventas: sedes y categorías', () => {
     expect(alertar).toHaveBeenCalledTimes(1);
     expect(alertar.mock.calls[0][0]).toMatch(/Categorías nuevas/);
   });
+
+  // Inventario → Categorías (2026-10-29): un supervisor renombra "Truf" a "Throw" o
+  // "comedores" a "Bases de comedor". El agente tiene que seguirla reconociendo.
+  test('una categoría renombrada en el sistema sigue siendo la misma para el agente', () => {
+    const { aplicarRenombres } = require('../../contrato-bd');
+    const categorias = { camas: 'Camas', bases_comedores: 'Comedores', throw: 'Throw' };
+    const mapa = { comedores: 'bases_comedores', Truf: 'throw' };
+
+    const aprendidas = aplicarRenombres([
+      { nombre_viejo: 'comedores', nombre_nuevo: 'Bases de comedor' },
+      { nombre_viejo: 'Truf', nombre_nuevo: 'Mantas' },
+      { nombre_viejo: 'camas', nombre_nuevo: 'Camas y bases' },
+      { nombre_viejo: 'Inventada', nombre_nuevo: 'Otra' },        // el agente no la conocía
+      { nombre_viejo: 'camas', nombre_nuevo: 'comedores' },       // lo de negocio.json no se pisa
+    ], { categorias, mapaCategoriasBD: mapa });
+
+    expect(mapa['Bases de comedor']).toBe('bases_comedores');
+    expect(mapa.Mantas).toBe('throw');
+    expect(mapa['Camas y bases']).toBe('camas');
+    expect(mapa.Otra).toBeUndefined();
+    expect(mapa.comedores).toBe('bases_comedores');
+    expect(aprendidas).toHaveLength(3);
+  });
+
+  test('con el renombre anotado no avisa "categoría nueva"', async () => {
+    const negocio = negocioFalso();
+    negocio.mapaCategoriasBD = { Truf: 'throw' };
+    const alertar = jest.fn();
+    const pool = poolCon([{ id: 1, activa: 1 }, { id: 2, activa: 1 }, { id: 5, activa: 0 }]);
+    const query = pool.query;
+    pool.query = jest.fn(async (sql, ...r) => sql.includes('categorias_renombradas')
+      ? [[{ nombre_viejo: 'Truf', nombre_nuevo: 'Throw gris' }]]
+      : query(sql, ...r));
+    const revisar = crearRevisionSistema({ pool, negocio, alertar, log: silencio, secciones: () => [{ categoria: 'Throw gris', productos: 2 }] });
+
+    await revisar();
+    expect(negocio.mapaCategoriasBD['Throw gris']).toBe('throw');
+    expect(alertar).not.toHaveBeenCalled();
+  });
 });
 
 describe('alias de catálogos: cómo lo pide el cliente → cómo se llama en Gestión', () => {
