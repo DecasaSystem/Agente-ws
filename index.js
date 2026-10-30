@@ -852,6 +852,20 @@ function infoPrecioVariantes(p) {
 // cuyo precio depende de una combinación de opciones no lo llevan: ese precio lo da un asesor.
 // Tampoco lo llevan los que no están en existencia: lo que se fabrica no tiene descuento
 // (dueño, 2026-10-20); en su lugar va nota_descuento para que Elena lo explique.
+// En qué hoja del catálogo está el producto (nombre de la hoja en Gestión → Catálogos):
+// así Elena puede ofrecer mandarle esa hoja, con el modelo y los parecidos (caso real del
+// 2026-10-29: "están al final, a partir del modular confort").
+function hojaDelCatalogo(p) {
+  const h = catalogos.hojaDelProducto(p.nombre);
+  return h ? { hoja_del_catalogo: h.nombre, catalogo_de_la_hoja: h.catalogo } : {};
+}
+
+function notaHojas(productos) {
+  return productos.some(p => catalogos.hojaDelProducto(p.nombre))
+    ? { nota_hojas: 'Los que traen hoja_del_catalogo están en esa hoja del catálogo. Si el cliente se interesa por uno, ofrécele mandarle esa hoja para ver el modelo y los parecidos: enviar_catalogo con categoria = catalogo_de_la_hoja y hoja = hoja_del_catalogo, tal cual.' }
+    : {};
+}
+
 function conPrecioEfectivo(info, producto) {
   // Promociones del sistema de ventas (core/promociones.js): todas las vigentes del producto
   // van en `promociones` (con tiendas y hasta cuándo). Si una le toca a la versión y está en
@@ -1554,7 +1568,9 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
       await recordarMostrados(from, resultados);
       return {
         encontrados: resultados.length,
+        ...notaHojas(resultados),
         productos: resultados.map(p => ({
+          ...hojaDelCatalogo(p),
           nombre: p.nombre,
           ...conPrecioEfectivo(infoPrecioVariantes(p), p),
           ...infoVentaPorJuego(p, parsearPrecio(p.precio)),
@@ -1593,7 +1609,9 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
       return {
         encontrados: resultados.length,
         presupuesto: formatearMoneda(presupuesto),
+        ...notaHojas(resultados),
         productos: resultados.map(p => ({
+          ...hojaDelCatalogo(p),
           nombre: p.nombre,
           ...conPrecioEfectivo(infoPrecioVariantes(p), p),
           ...infoVentaPorJuego(p, parsearPrecio(p.precio)),

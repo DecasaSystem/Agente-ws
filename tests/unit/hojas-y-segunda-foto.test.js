@@ -88,3 +88,34 @@ describe('hojas del catálogo', () => {
     expect(f.hojas).toBeUndefined();
   });
 });
+
+// La búsqueda dice en qué hoja está cada producto, para ofrecer esa hoja (2026-10-30).
+describe('hojaDelProducto: en qué hoja del catálogo está un producto', () => {
+  const { hojaDelProducto } = require('../../catalogos');
+  const etiquetas = { camas: 'Camas', sofas: 'Sofás', sofas_modulares: 'Sofás Modulares' };
+  const hojas = [
+    { nombre: 'Camas Bali y Roma', catalogo: 'Camas' },
+    { nombre: 'Sofá Confort y Modular Terra', catalogo: 'Sofas y modulares' },
+    { nombre: 'Sofacama Roma', catalogo: 'Sofa camas' },
+    { nombre: 'Torello', catalogo: 'Sofas y modulares' },
+  ];
+  const hoja = n => hojaDelProducto(n, { hojas }, { etiquetas })?.nombre ?? null;
+
+  test('por las palabras propias del producto, sin importar las genéricas ni la medida', () => {
+    expect(hoja('CAMA BALI')).toBe('Camas Bali y Roma');
+    expect(hoja('CAMA BALI 1.40')).toBe('Camas Bali y Roma');
+    expect(hoja('MODULAR TERRA')).toBe('Sofá Confort y Modular Terra');
+    expect(hoja('SOFA TORELLO')).toBe('Torello');
+  });
+
+  test('si dos hojas comparten el nombre, gana la que encaja completa', () => {
+    expect(hoja('CAMA ROMA')).toBe('Camas Bali y Roma');
+    expect(hoja('SOFACAMA ROMA')).toBe('Sofacama Roma');
+  });
+
+  test('sin hoja, o solo con palabras genéricas, no adivina', () => {
+    expect(hoja('CAMA MIAMI')).toBeNull();
+    expect(hoja('CAMA DOBLE')).toBeNull();
+    expect(hojaDelProducto('CAMA BALI', {}, { etiquetas })).toBeNull();
+  });
+});
