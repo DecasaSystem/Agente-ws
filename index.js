@@ -66,6 +66,7 @@ const { fetchWithRetry } = require('./httpClient');
 const imgHash = require('./image-hash');
 const fechas = require('./fechas');
 const visionCatalogo = require('./vision-catalogo');
+const fotosProducto = require('./fotos-producto');
 const { crearCatalogos } = require('./catalogos');
 const seguridad = require('./seguridad');
 const { randomUUID } = require('crypto');
@@ -173,16 +174,17 @@ async function cargarInventario() {
 
 // ─── HASH DE IMÁGENES DE CATÁLOGO (identificar fotos reenviadas/capturadas) ───
 
-let hashesCatalogo = new Map(); // nombre -> { hash, imagen }
+let hashesCatalogo = new Map(); // clave (nombre, o nombre + ' · foto 2') -> { hash, imagen }
 
 function productosPlanos() {
   const plano = [];
   for (const cat of Object.values(inventario)) {
     for (const p of cat.productos || []) {
-      if (p.imagen) plano.push({ nombre: p.nombre, imagen: p.imagen });
+      plano.push({ nombre: p.nombre, imagen: p.imagen, imagen2: p.imagen2 });
     }
   }
-  return plano;
+  // Las dos fotos de Inventario se indexan (core/fotos-producto.js).
+  return fotosProducto.fotosParaIndexar(plano);
 }
 
 async function sincronizarHashesCatalogo() {
@@ -196,15 +198,15 @@ async function sincronizarHashesCatalogo() {
     // conviene bajarlas todas de un tirón en un servidor con poca RAM — el resto
     // se completa en los siguientes ciclos.
     const LOTE_MAX = 60;
-    const todosPendientes = productosPlanos().filter(p => hashesCatalogo.get(p.nombre)?.imagen !== p.imagen);
+    const todosPendientes = productosPlanos().filter(p => hashesCatalogo.get(p.clave)?.imagen !== p.imagen);
     const pendientes = todosPendientes.slice(0, LOTE_MAX);
     for (const p of pendientes) {
       try {
         const hash = await imgHash.hashDesdeUrl(p.imagen);
-        await db.upsertHashProducto(p.nombre, p.imagen, hash);
-        hashesCatalogo.set(p.nombre, { hash, imagen: p.imagen });
+        await db.upsertHashProducto(p.clave, p.imagen, hash);
+        hashesCatalogo.set(p.clave, { hash, imagen: p.imagen });
       } catch (e) {
-        console.warn(`[hash-imagen] no se pudo procesar "${p.nombre}":`, e.message);
+        console.warn(`[hash-imagen] no se pudo procesar "${p.clave}":`, e.message);
       }
       await new Promise(r => setTimeout(r, 150));
     }
@@ -226,7 +228,7 @@ async function identificarImagenPorCategoria(from, imagen) {
   for (const [clave, cat] of Object.entries(inventario)) {
     categorias.push({ clave, nombre: cat.nombre || clave });
     for (const p of cat.productos || []) {
-      inventarioPlano.push({ nombre: p.nombre, imagen: p.imagen || null, medidas: p.medidas || '', material: p.material || '', precio: p.precio, categoria: clave });
+      inventarioPlano.push({ nombre: p.nombre, imagen: p.imagen || null, imagen2: p.imagen2 || null, medidas: p.medidas || '', material: p.material || '', precio: p.precio, categoria: clave });
     }
   }
   if (!inventarioPlano.length) return null;
@@ -257,7 +259,7 @@ async function identificarProductoPorImagen(buffer) {
     const hashesEntrada = await imgHash.hashesCandidatos(buffer);
     const catalogoArr = [...hashesCatalogo.entries()].map(([nombre, v]) => [nombre, v.hash]);
     const match = imgHash.mejorCoincidencia(hashesEntrada, catalogoArr);
-    return match?.nombre ?? null;
+    return match ? fotosProducto.nombreDeClave(match.nombre) : null;
   } catch (e) {
     console.warn('[hash-imagen] no se pudo comparar imagen entrante:', e.message);
     return null;
@@ -1316,6 +1318,10 @@ const TOOLS = [
           categoria: {
             type: 'string',
             description: "La categoría que pide el cliente. Usa la clave si la conoces (sofas, camas, bases_comedores, sillas_comedor, sillas_auxiliares, sillas_barra, mesas_centro, mesas_noche, mesas_tv, mesas_auxiliares, sofas_camas, sofas_modulares, cajoneros_bifes, colchones, escritorios) y, si no está ahí, la palabra del cliente (p. ej. \"cunas\"). Si es ambigua (\"sillas\", \"mesas\"), pregunta antes cuál. Si pide el catálogo en general, sin decir de qué, usa \"todos\": le llega la portada con todos los catálogos."
+          },
+          hoja: {
+            type: 'string',
+            description: "Opcional. El NOMBRE de una hoja del catálogo, tal como te lo dio esta herramienta en `hojas` (p. ej. \"Camas Bali y Roma\"), o el producto que busca el cliente (\"bali\"). Úsalo cuando el cliente busca algo puntual: le llega solo esa hoja (la imagen y un enlace que abre el catálogo en esa hoja). Si no hay una hoja con ese nombre, le llega el catálogo completo. Nunca inventes nombres de hojas."
           }
         },
         required: ['categoria']
@@ -1948,10 +1954,31 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
         .filter(([clave, cat]) => catalogos.delPedido(categoria ?? '', [clave, cat.nombre], encontrado.nombre))
         .flatMap(([, cat]) => cat.productos || []);
       const promosCat = promociones.promocionesDeProductos(productosCat);
+      // Una hoja puntual (nombre de la hoja en Gestión → Catálogos, 2026-10-30): le llega
+      // la imagen de esa hoja y el enlace que abre el catálogo ahí. Si no hay una hoja con
+      // ese nombre, va el catálogo completo; si hay varias, se le dicen al modelo.
+      const busqueda = args.hoja ? catalogos.hoja(args.hoja, encontrado.slug) : null;
+      const hoja = busqueda?.hoja ?? null;
+      if (hoja) evento(telefono, 'catalogo_hoja', `${hoja.catalogo}: ${hoja.nombre}`);
+      const hojas = !hoja && encontrado.slug ? catalogos.hojasDe(encontrado.slug) : [];
       return {
         exito: true,
-        url: encontrado.url,
+        url: hoja ? hoja.url : encontrado.url,
         categoria: encontrado.nombre,
+        ...(hoja && {
+          hoja: hoja.nombre,
+          _imagenUrl: hoja.imagen,
+          nota_hoja: `Le llega la imagen de la hoja "${hoja.nombre}" del catálogo de ${hoja.catalogo}. El enlace abre el catálogo en esa hoja: dile que puede pasar las páginas para ver el resto.`,
+        }),
+        ...(busqueda?.opciones && {
+          hojas_parecidas: busqueda.opciones,
+          nota_hoja: 'Varias hojas encajan con lo que pidió y se le mandó el catálogo completo. Si quiere una en particular, pregúntale cuál de estas y vuelve a llamar con su nombre exacto.',
+        }),
+        ...(args.hoja && !busqueda && { nota_hoja: 'No hay una hoja con ese nombre: se le mandó el catálogo completo.' }),
+        ...(hojas.length && {
+          hojas,
+          nota_hojas: 'Son las hojas con nombre de este catálogo. Si el cliente busca algo puntual que está en una de ellas, puedes mandarle solo esa hoja llamando otra vez con hoja = su nombre.',
+        }),
         ...(encontrado.fuente === 'inventario' && { nota: 'Es la página en línea de esa categoría, con fotos y precios actualizados. Preséntalo así (no como un PDF).' }),
         ...(promosCat.length && {
           promociones_vigentes: promosCat,
@@ -2452,7 +2479,12 @@ async function runAgentLoop(from, mensajeUsuario, opciones = {}) {
         // directo y WhatsApp falla silenciosamente. La URL va en el texto de la respuesta.
         if (toolCall.function.name === 'enviar_foto' && resultado.exito) {
           if (resultado._imagenUrl) imagenesParaEnviar.push({ url: resultado._imagenUrl, nombre: resultado.nombre });
-          if (resultado._imagen2Url) imagenesParaEnviar.push({ url: resultado._imagen2Url, nombre: resultado.nombre });
+          if (resultado._imagen2Url && resultado._imagen2Url !== resultado._imagenUrl) imagenesParaEnviar.push({ url: resultado._imagen2Url, nombre: resultado.nombre });
+        }
+        // Una hoja puntual del catálogo visual sí va como imagen: vive en Cloudinary, que
+        // WhatsApp sí descarga (a diferencia de los PDF de Drive).
+        if (toolCall.function.name === 'enviar_catalogo' && resultado.exito && resultado._imagenUrl) {
+          imagenesParaEnviar.push({ url: resultado._imagenUrl, nombre: resultado.hoja });
         }
 
         const resultadoStr = JSON.stringify(resultado);

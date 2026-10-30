@@ -1572,6 +1572,9 @@ async function getInventarioFromDB() {
       material: row.material || '',
       precio:   formatearPrecioFromDB(row.precio),
       imagen:   row.imagen || '',
+      // La foto adicional de Inventario. Se leía en el SELECT pero no pasaba al producto:
+      // enviar_foto nunca mandaba la segunda por WhatsApp (en Instagram sí). 2026-10-30.
+      imagen2:  row.imagen2 || null,
       descripcion: row.descripcion || '',
       // Venta por juego (ver precio-variantes.js → infoVentaPorJuego).
       piezasPorJuego: row.piezasPorJuego ?? null,
