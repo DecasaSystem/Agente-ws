@@ -81,7 +81,7 @@ const vigilancia = require('./vigilancia');
 const seguimientos = require('./seguimientos');
 const memoria = require('./memoria');
 const contacto = require('./contacto');
-const { revisarRespuesta } = require('./verificacion');
+const { revisarRespuesta, sinCamposInternos, quitarEnlacesDeImagenes } = require('./verificacion');
 const log = require('./log');
 const { conReintentos } = reintentos;
 
@@ -2505,7 +2505,9 @@ async function runAgentLoop(from, mensajeUsuario, opciones = {}) {
           imagenesParaEnviar.push({ url: resultado._imagenUrl, nombre: resultado.hoja });
         }
 
-        const resultadoStr = JSON.stringify(resultado);
+        // Lo que empieza por "_" (las URLs de las fotos) es para el código: si el modelo lo
+        // ve, lo copia en la respuesta y el cliente recibe el enlace antes que la foto.
+        const resultadoStr = JSON.stringify(resultado, sinCamposInternos);
         herramientasTurno.push(toolCall.function.name);
         if (seguimientos.HERRAMIENTAS_DE_INTERES.has(toolCall.function.name)) productoTurno = seguimientos.productoDeArgs(toolArgs) ?? productoTurno;
         resultadosTurno.push(resultadoStr);
@@ -2526,7 +2528,8 @@ async function runAgentLoop(from, mensajeUsuario, opciones = {}) {
 
     } else {
       if (await asesorTomoElChat(ronda + 1)) return DESCARTADA;
-      const texto = choice.message.content || 'Disculpa, no pude generar una respuesta. Por favor intenta de nuevo. 😊';
+      // Las fotos van como imagen aparte: un enlace a una imagen en el texto sobra (verificacion.js).
+      const texto = quitarEnlacesDeImagenes(choice.message.content || 'Disculpa, no pude generar una respuesta. Por favor intenta de nuevo. 😊');
       // Que no diga que hizo algo que no hizo, ni mande un enlace inventado: si pasa, la
       // respuesta no sale y el modelo la corrige (una vez, y solo si quedan rondas).
       const correccion = !yaCorregida && ronda < maxRondas - 1
