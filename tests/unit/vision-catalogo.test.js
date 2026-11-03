@@ -171,3 +171,24 @@ describe('compararConCategoria', () => {
     expect(openai.llamadas).toHaveLength(0);
   });
 });
+
+// Caso real del 2026-11-03: "¿puedo mandar a hacer una cuna diferente?" → "sí, mándame tu
+// diseño". La foto que llega después es su diseño, aunque se parezca a algo nuestro.
+describe('construirContextoVision y el diseño propio del cliente', () => {
+  const formatear = (p) => p.nombre;
+  test('todo bloque de visión recuerda que la foto puede ser el diseño que quiere mandar a hacer', () => {
+    const resultados = [
+      { tipo: 'alta', producto: INVENTARIO[0], coincidencias: [{ similitud: 95, razon: 'igual' }] },
+      { tipo: 'sin_coincidencia', clasificacion: { categorias: ['Cunas'] }, coincidencias: [] },
+    ];
+    for (const r of resultados) {
+      const ctx = vc.construirContextoVision(r, formatear);
+      expect(ctx).toMatch(/MANDAR A HACER su propio diseño/);
+      expect(ctx.endsWith(']')).toBe(true);
+    }
+  });
+
+  test('sin resultado sigue sin contexto', () => {
+    expect(vc.construirContextoVision(null, formatear)).toBeNull();
+  });
+});
