@@ -219,8 +219,8 @@ describe('Transferencia fuera de horario', () => {
     expect(resultadoTool.mensaje).toContain('sigues aquí');
   });
 
-  test('a las 4:40 pm ya cuenta como fuera de horario (margen de 20 min antes del cierre)', async () => {
-    jest.setSystemTime(new Date('2026-09-15T21:40:00Z')); // martes 16:40 Bogotá
+  test('a las 4:15 pm ya cuenta como fuera de horario (cierre 4:35 pm, margen de 20 min)', async () => {
+    jest.setSystemTime(new Date('2026-09-15T21:15:00Z')); // martes 16:15 Bogotá
     db.solicitudAsesorPendiente.mockResolvedValue(false);
     mockOpenAICreate
       .mockResolvedValueOnce(respuestaConTool('transferir_asesor', { razon: 'Pregunta por garantía', nombre: 'Laura Gómez', telefono_contacto: 'este_mismo' }))
@@ -232,8 +232,8 @@ describe('Transferencia fuera de horario', () => {
     expect(db.marcarTransferida).not.toHaveBeenCalled();
   });
 
-  test('a las 4:39 pm todavía transfiere en el momento', async () => {
-    jest.setSystemTime(new Date('2026-09-15T21:39:00Z')); // martes 16:39 Bogotá
+  test('a las 4:14 pm todavía transfiere en el momento', async () => {
+    jest.setSystemTime(new Date('2026-09-15T21:14:00Z')); // martes 16:14 Bogotá
     mockOpenAICreate
       .mockResolvedValueOnce(respuestaConTool('transferir_asesor', { razon: 'Pregunta por garantía', nombre: 'Laura Gómez', telefono_contacto: 'este_mismo' }))
       .mockResolvedValue(respuestaSimple('Te conecto con un asesor 😊'));

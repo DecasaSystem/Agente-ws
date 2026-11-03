@@ -2017,7 +2017,7 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
       // Antes bastaba con que apareciera la palabra "martes" en el texto, y el asesor
       // recibía citas como "martes 3 de junio de 2026" (que es miércoles) sin saber a
       // cuál de los dos días atenerse.
-      const val = fechas.validarFechaHoraCita(dia, hora, { cerradoEnFestivos: negocio.cerradoEnFestivos });
+      const val = fechas.validarFechaHoraCita(dia, hora, { horario: negocio.horarioCitas, cerradoEnFestivos: negocio.cerradoEnFestivos });
       if (!val.ok) return { exito: false, error: val.error };
 
       const horaFormateada = val.hora;
