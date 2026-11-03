@@ -81,6 +81,7 @@ const vigilancia = require('./vigilancia');
 const seguimientos = require('./seguimientos');
 const memoria = require('./memoria');
 const contacto = require('./contacto');
+const contactoProgramado = require('./contacto-programado');
 const { revisarRespuesta, sinCamposInternos, quitarEnlacesDeImagenes } = require('./verificacion');
 const log = require('./log');
 const { conReintentos } = reintentos;
@@ -616,6 +617,20 @@ function notificarRedes(telefono, mensaje, historial, tipo = 'asesor', extra = {
         alertar(`No se pudo encolar notificación ${tipo}`, `${telefono} — ${enqErr.message}`);
       }
     });
+}
+
+// Un aviso que debe llegar MÁS TARDE ("que me contacten mañana a las 11"): va directo a la
+// cola con su hora de envío; el worker lo manda cuando toque, con la misma idempotencia y
+// los mismos reintentos. El sistema de ventas no tiene "contactar a tal hora", así que la
+// tarjeta (y el aviso al celular del asesor) es el recordatorio. Se espera la escritura: si
+// la base falla, Elena no debe decirle al cliente que quedó programado.
+async function programarNotificacionRedes(telefono, mensaje, historial, tipo, extra, retrasoSegundos) {
+  if (!(retrasoSegundos >= 60)) return notificarRedes(telefono, mensaje, historial, tipo, extra);
+  await db.encolarNotificacion(telefono, tipo, {
+    mensaje,
+    extra: { ...extra, idempotencia: extra.idempotencia || randomUUID() },
+    historial: (historial || []).slice(-8).map(m => ({ role: m.role, content: String(m.content).substring(0, 150) })),
+  }, retrasoSegundos);
 }
 
 // Pone al día la ficha del cliente en Clientes → Redes del sistema de ventas: nombre,
@@ -1402,6 +1417,7 @@ const TOOLS = [
             description: "Usa 'personalizacion' cuando el cliente quiere un mueble a la medida, un color o acabado especial, o una restauración/reparación. Para todo lo demás usa 'asesor'."
           },
           ...PARAMS_CONTACTO,
+          ...contactoProgramado.PARAMS_PROGRAMAR,
         },
         required: ['razon']
       }
@@ -2191,6 +2207,19 @@ async function ejecutarHerramienta(nombre, args, from, historial) {
       }
       const lineaContactoTr = contacto.lineaContacto(datosContacto);
       if (lineaContactoTr) razonFinal = `${lineaContactoTr}\n${razonFinal}`;
+      // "Que me contacten mañana a las 11" (caso real del 2026-11-03): la tarjeta llega
+      // unos minutos antes de esa hora, no ahora, y la IA no se silencia mientras tanto.
+      if (args.contactar_dia || args.contactar_hora) {
+        const prog = contactoProgramado.programarContacto(negocio, args.contactar_dia, args.contactar_hora, { herramienta: 'transferir_asesor' });
+        if (!prog.ok) return { exito: false, error: prog.error };
+        await programarNotificacionRedes(telefono, `${prog.lineaResumen}\n${razonFinal}`, historial, tipoTransferencia, { carrito: carritoActual.length ? carritoActual : undefined, ...extraContacto }, prog.retrasoSegundos);
+        evento(telefono, 'transferencia', `${tipoTransferencia} programada para el ${prog.texto}: ${razon}`);
+        return {
+          exito: true,
+          programado: prog.texto,
+          mensaje: `PROGRAMADO: un asesor lo contactará el ${prog.texto}${datosContacto.telefono ? ' al número que dejó' : ' por aquí'}. Díselo así, con ese día y esa hora. Es un contacto del asesor, NO una cita en la tienda: no digas "te agendamos una cita/visita". MIENTRAS TANTO tú sigues atendiéndolo con normalidad; no te despidas como si lo transfirieras ya y no vuelvas a llamar transferir_asesor por este motivo.`,
+        };
+      }
       // Fuera de horario (o a menos de 20 min del cierre): nadie va a tomar la tarjeta
       // hasta el próximo día hábil, así que NO se silencia a la IA — antes el cliente
       // quedaba toda la noche hablando con nadie. La tarjeta se crea igual (el asesor la

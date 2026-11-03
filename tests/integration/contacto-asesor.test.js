@@ -287,3 +287,42 @@ describe('promociones del sistema de ventas', () => {
     expect(avisos()[0].resumen).toMatch(/CAMA BALI \(1\.40\) - \$1\.275\.000 \[Feria de octubre −15 %/);
   });
 });
+
+// Caso real del 2026-11-03: "me gustaría mañana porque ahorita no puedo, ¿qué tal mañana a
+// las 11?". Elena dijo "te agendamos" y nada llegó al sistema. Ahora la tarjeta se programa
+// en la cola para unos minutos antes de esa hora, y solo en horario de atención.
+describe('transferir_asesor con hora para que lo contacten', () => {
+  const fechas = require('../../fechas');
+  const db = require('../../db');
+  // Un día hábil (lunes a viernes, sin festivo) desde pasado mañana, para no depender de hoy.
+  const diaHabil = () => {
+    let d = fechas.sumarDias(fechas.hoy(), 2);
+    while ([0, 6].includes(d.getUTCDay()) || fechas.festivo(d)) d = fechas.sumarDias(d, 1);
+    return fechas.textoLargo(d);
+  };
+  const datos = { razon: 'Cotizar base a la medida', tipo: 'personalizacion', nombre: 'Joan Esteban', telefono_contacto: 'este_mismo' };
+
+  test('a las 11 de un día hábil: se encola para más tarde, no se manda ya ni se silencia a Elena', async () => {
+    const r = await ejecutarHerramienta('transferir_asesor', { ...datos, contactar_dia: diaHabil(), contactar_hora: '11:00' }, DE, []);
+    await esperar();
+    expect(r.exito).toBe(true);
+    expect(r.programado).toMatch(/a las 11:00 am/);
+    expect(r.mensaje).toMatch(/NO una cita/);
+    expect(avisos()).toHaveLength(0);
+    expect(mockMarcarTransferida).not.toHaveBeenCalled();
+    const [tel, tipo, payload, retraso] = db.encolarNotificacion.mock.calls.at(-1);
+    expect(tel).toBe('+573001112233');
+    expect(tipo).toBe('personalizacion');
+    expect(payload.mensaje).toMatch(/^⏰ CONTACTAR EL .* A LAS 11:00 AM/);
+    expect(payload.extra.idempotencia).toBeTruthy();
+    expect(retraso).toBeGreaterThan(24 * 3600);
+  });
+
+  test('a las 5 pm no se programa: Elena recibe el rango de atención para proponer otra hora', async () => {
+    db.encolarNotificacion.mockClear();
+    const r = await ejecutarHerramienta('transferir_asesor', { ...datos, contactar_dia: diaHabil(), contactar_hora: '17:00' }, DE, []);
+    expect(r.exito).toBe(false);
+    expect(r.error).toMatch(/entre las 8:00 am y las 4:15 pm/);
+    expect(db.encolarNotificacion).not.toHaveBeenCalled();
+  });
+});
