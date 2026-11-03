@@ -871,7 +871,12 @@ function conPrecioEfectivo(info, producto) {
   // van en `promociones` (con tiendas y hasta cuándo). Si una le toca a la versión y está en
   // existencia, el precio que vale es `precio_promocion` y el 5 % se calcula sobre él.
   const promos = producto ? promociones.resumenPromociones(producto) : [];
-  const conPromos = r => (promos.length ? { ...r, promociones: promos } : r);
+  // En existencia = entrega inmediata (dueño, 2026-11-03); va también en lo que cotiza un asesor.
+  const enExistencia = negocio.notaEnExistencia(producto);
+  const conPromos = r => {
+    const conExistencia = enExistencia ? { ...r, en_existencia: enExistencia } : r;
+    return promos.length ? { ...conExistencia, promociones: promos } : conExistencia;
+  };
   if (info.precio_requiere_asesor) return conPromos(info);
   const descuento = Boolean(negocio.porcentajeDescuentoEfectivo) && negocio.aplicaDescuentoEfectivo(producto);
   const nota = negocio.porcentajeDescuentoEfectivo && !descuento ? negocio.notaSinDescuento(producto) : null;
